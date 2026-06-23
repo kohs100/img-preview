@@ -65,7 +65,20 @@ export class CacheManager {
 
   /** Rebuild the in-memory index from the `.meta.json` sidecars in storage. */
   async rebuildFromStorage(): Promise<void> {
-    const allKeys = await this.storage.list();
+    let allKeys: string[];
+    try {
+      allKeys = await this.storage.list();
+    } catch (error) {
+      // A listing failure (transient backend error, missing permission) must
+      // not stop startup — the cache repopulates on demand. Log and continue.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `Cache index rebuild skipped: ${
+          error instanceof Error ? error.message : error
+        }`
+      );
+      return;
+    }
     const metaKeys = allKeys.filter((key) => key.endsWith(cacheMetaSuffix));
 
     for (const metaKey of metaKeys) {

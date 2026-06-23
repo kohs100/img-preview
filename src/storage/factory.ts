@@ -40,6 +40,9 @@ export function backendConfigFromEnv(
     secretAccessKey: process.env.S3_SECRET_ACCESS_KEY || undefined,
     forcePathStyle: envBool(process.env.S3_FORCE_PATH_STYLE, true),
     prefix: process.env.S3_PREFIX || "",
+    publicUrlBase: process.env.S3_PUBLIC_URL_BASE || undefined,
+    presign: envBool(process.env.S3_PRESIGN, false),
+    presignExpires: Number(process.env.S3_PRESIGN_EXPIRES || "300") || 300,
   };
 }
 

@@ -8,6 +8,10 @@ const port = process.env.PORT ? Number(process.env.PORT) : 3013;
 const originMinIntervalMs = process.env.ORIGIN_MIN_INTERVAL_MS
   ? Number(process.env.ORIGIN_MIN_INTERVAL_MS)
   : 200;
+// How long a cached origin error is honored before the next request retries it.
+const errorRetryMs = process.env.ERROR_RETRY_MS
+  ? Number(process.env.ERROR_RETRY_MS)
+  : 5 * 60 * 1000;
 const backendConfig = backendConfigFromEnv();
 const storage = createStorage(backendConfig);
 const cacheManager = new CacheManager(storage);
@@ -93,6 +97,22 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
   const entry = cacheManager.get(cacheKey);
 
   if (entry?.status === "ready" && entry.key && entry.contentType) {
+    // Offload the byte transfer to the storage backend when it can hand out a
+    // browser-reachable URL (public/presigned). A failure to build that URL
+    // must never break serving, so it degrades to streaming the bytes instead.
+    let redirectUrl: string | null = null;
+    if (storage.getRedirectUrl) {
+      try {
+        redirectUrl = await storage.getRedirectUrl(entry.key);
+      } catch {
+        redirectUrl = null;
+      }
+    }
+    if (redirectUrl) {
+      res.redirect(302, redirectUrl);
+      return;
+    }
+
     try {
       const fileBuffer = await storage.read(entry.key);
       res.setHeader("Content-Type", entry.contentType);
@@ -111,6 +131,13 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
   }
 
   if (entry?.status === "error") {
+    const errorAgeMs = Date.now() - entry.updatedAt;
+    if (errorRetryMs > 0 && errorAgeMs >= errorRetryMs) {
+      // Cached error is stale; retry the origin instead of serving it again.
+      startDownload(cacheKey, fetchUrl, referrer);
+      res.status(503).send("Processing");
+      return;
+    }
     res.status(entry.errorStatusCode ?? 502).send(entry.errorMessage || "Upstream fetch failed");
     return;
   }

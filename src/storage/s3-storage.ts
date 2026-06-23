@@ -6,6 +6,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { ObjectStorage, S3BackendConfig } from "./types";
 
 /**
@@ -23,9 +24,18 @@ export class S3Storage implements ObjectStorage {
 
   private readonly prefix: string;
 
+  private readonly publicUrlBase?: string;
+
+  private readonly presign: boolean;
+
+  private readonly presignExpires: number;
+
   constructor(config: S3BackendConfig) {
     this.bucket = config.bucket;
     this.prefix = config.prefix ? config.prefix.replace(/\/+$/, "") + "/" : "";
+    this.publicUrlBase = config.publicUrlBase?.replace(/\/+$/, "");
+    this.presign = config.presign;
+    this.presignExpires = config.presignExpires;
     this.client = new S3Client({
       region: config.region,
       endpoint: config.endpoint,
@@ -108,5 +118,24 @@ export class S3Storage implements ObjectStorage {
         Key: this.toObjectKey(key),
       })
     );
+  }
+
+  async getRedirectUrl(key: string): Promise<string | null> {
+    const objectKey = this.toObjectKey(key);
+    if (this.publicUrlBase && !this.presign) {
+      const encodedPath = objectKey
+        .split("/")
+        .map((segment) => encodeURIComponent(segment))
+        .join("/");
+      return `${this.publicUrlBase}/${encodedPath}`;
+    }
+    if (this.presign) {
+      return getSignedUrl(
+        this.client,
+        new GetObjectCommand({ Bucket: this.bucket, Key: objectKey }),
+        { expiresIn: this.presignExpires }
+      );
+    }
+    return null;
   }
 }
