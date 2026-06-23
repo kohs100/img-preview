@@ -1,7 +1,5 @@
 import sharp from "sharp";
-import { createHash } from "crypto";
-import { mkdir, writeFile } from "fs/promises";
-import path from "path";
+import type { ObjectStorage } from "./storage";
 
 export class UpstreamHttpError extends Error {
   statusCode: number;
@@ -12,10 +10,13 @@ export class UpstreamHttpError extends Error {
   }
 }
 
+/**
+ * Fetches images from origin (rate-limited per host), optionally transcodes
+ * PNG to WebP, and writes the result through an {@link ObjectStorage} backend.
+ * Returns the storage key + content type of the servable object.
+ */
 export class DownloadManager {
-  private readonly sourceDir: string;
-
-  private readonly processedDir: string;
+  private readonly storage: ObjectStorage;
 
   private readonly originMinIntervalMs: number;
 
@@ -23,15 +24,15 @@ export class DownloadManager {
 
   private readonly originNextAllowedAt = new Map<string, number>();
 
-  constructor(cacheDir: string, originMinIntervalMs: number) {
-    this.sourceDir = path.join(cacheDir, "source");
-    this.processedDir = path.join(cacheDir, "processed");
+  constructor(storage: ObjectStorage, originMinIntervalMs: number) {
+    this.storage = storage;
     this.originMinIntervalMs = originMinIntervalMs;
   }
 
-  async downloadAndProcess(url: string, referrer: string): Promise<{ filePath: string; contentType: string }> {
-    await mkdir(this.sourceDir, { recursive: true });
-
+  async downloadAndProcess(
+    url: string,
+    referrer: string
+  ): Promise<{ key: string; contentType: string }> {
     await this.throttleOriginRequest(url);
     const res = await fetch(url, { referrer });
     if (!res.ok) {
@@ -44,23 +45,18 @@ export class DownloadManager {
     const sourceExt = this.extensionFromUrl(url) || this.extensionFromContentType(headerType);
     const isPng = headerType.includes("image/png") || url.toLowerCase().endsWith(".png");
     const processedExt = isPng ? ".webp" : sourceExt || ".bin";
-    const { sourcePath, processedPath } = this.buildCachePaths(url, sourceExt, processedExt);
+    const { sourceKey, processedKey } = this.buildCacheKeys(url, sourceExt, processedExt);
 
-    await mkdir(path.dirname(sourcePath), { recursive: true });
-    await writeFile(sourcePath, inputBuffer);
+    const sourceContentType = headerType || "application/octet-stream";
+    await this.storage.write(sourceKey, inputBuffer, sourceContentType);
 
     if (!isPng) {
-      return {
-        filePath: sourcePath,
-        contentType: headerType || "application/octet-stream",
-      };
+      return { key: sourceKey, contentType: sourceContentType };
     }
 
-    await mkdir(this.processedDir, { recursive: true });
-    await mkdir(path.dirname(processedPath), { recursive: true });
     const outputBuffer = await sharp(inputBuffer).webp({ quality: 80 }).toBuffer();
-    await writeFile(processedPath, outputBuffer);
-    return { filePath: processedPath, contentType: "image/webp" };
+    await this.storage.write(processedKey, outputBuffer, "image/webp");
+    return { key: processedKey, contentType: "image/webp" };
   }
 
   private async throttleOriginRequest(url: string): Promise<void> {
@@ -127,43 +123,28 @@ export class DownloadManager {
       .map((segment) => this.sanitizePathSegment(segment));
   }
 
-  // private makeQuerySuffix(search: string): string {
-  //   if (!search) return "";
-  //   const shortHash = createHash("sha1").update(search).digest("hex").slice(0, 8);
-  //   return `__q_${shortHash}`;
-  // }
-
-  // private withSuffixBeforeExt(filename: string, suffix: string): string {
-  //   if (!suffix) return filename;
-  //   const ext = path.extname(filename);
-  //   if (!ext) return `${filename}${suffix}`;
-  //   const base = filename.slice(0, -ext.length);
-  //   return `${base}${suffix}${ext}`;
-  // }
-
-  private buildCachePaths(url: string, sourceExt: string, processedExt: string) {
+  private buildCacheKeys(url: string, sourceExt: string, processedExt: string) {
     const parsed = new URL(url);
     const segments = this.splitPathname(parsed.pathname);
     const hostDir = this.sanitizePathSegment(parsed.hostname);
-    // const querySuffix = this.makeQuerySuffix(parsed.search);
 
     const hasDirectoryPath = parsed.pathname.endsWith("/") || segments.length === 0;
     const sourceName = hasDirectoryPath
       ? `index${sourceExt}`
       : segments.pop() || `index${sourceExt}`;
-    // const sourceFile = this.withSuffixBeforeExt(sourceName, querySuffix);
-    const sourceFile = sourceName;
-    const sourceRelative = path.join(hostDir, ...segments, sourceFile);
-    const sourcePath = path.join(this.sourceDir, sourceRelative);
+
+    const sourceKey = ["source", hostDir, ...segments, sourceName].join("/");
 
     const processedBase = hasDirectoryPath
       ? `index${processedExt}`
-      : `${path.parse(sourceName).name}${processedExt}`;
-    // const processedFile = this.withSuffixBeforeExt(processedBase, querySuffix);
-    const processedFile = processedBase;
-    const processedRelative = path.join(hostDir, ...segments, processedFile);
-    const processedPath = path.join(this.processedDir, processedRelative);
+      : `${this.stripExt(sourceName)}${processedExt}`;
+    const processedKey = ["processed", hostDir, ...segments, processedBase].join("/");
 
-    return { sourcePath, processedPath };
+    return { sourceKey, processedKey };
+  }
+
+  private stripExt(filename: string): string {
+    const dotIndex = filename.lastIndexOf(".");
+    return dotIndex > 0 ? filename.slice(0, dotIndex) : filename;
   }
 }

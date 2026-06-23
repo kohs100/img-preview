@@ -1,17 +1,17 @@
 import express from "express";
-import { readFile } from "fs/promises";
-import path from "path";
 import { CacheManager } from "./cache-manager";
 import { DownloadManager, UpstreamHttpError } from "./download-manager";
+import { backendConfigFromEnv, createStorage } from "./storage";
 
 const app = express();
 const port = process.env.PORT ? Number(process.env.PORT) : 3013;
-const cacheDir = path.resolve("cache");
 const originMinIntervalMs = process.env.ORIGIN_MIN_INTERVAL_MS
   ? Number(process.env.ORIGIN_MIN_INTERVAL_MS)
   : 200;
-const cacheManager = new CacheManager(cacheDir);
-const downloadManager = new DownloadManager(cacheDir, originMinIntervalMs);
+const backendConfig = backendConfigFromEnv();
+const storage = createStorage(backendConfig);
+const cacheManager = new CacheManager(storage);
+const downloadManager = new DownloadManager(storage, originMinIntervalMs);
 
 app.get("/", (_req, res) => {
   res.redirect("/static");
@@ -52,8 +52,8 @@ function startDownload(cacheKey: string, fetchUrl: string, referrer: string): vo
   cacheManager.setProcessing(cacheKey);
   downloadManager
     .downloadAndProcess(fetchUrl, referrer)
-    .then(({ filePath, contentType }) => {
-      return cacheManager.setReady(cacheKey, filePath, contentType);
+    .then(({ key, contentType }) => {
+      return cacheManager.setReady(cacheKey, key, contentType);
     })
     .catch((error: unknown) => {
       const errorStatusCode =
@@ -92,10 +92,16 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
   const { cacheKey, fetchUrl, referrer } = params;
   const entry = cacheManager.get(cacheKey);
 
-  if (entry?.status === "ready" && entry.filePath && entry.contentType) {
-    res.setHeader("Content-Type", entry.contentType);
-    const fileBuffer = await readFile(entry.filePath);
-    res.status(200).send(fileBuffer);
+  if (entry?.status === "ready" && entry.key && entry.contentType) {
+    try {
+      const fileBuffer = await storage.read(entry.key);
+      res.setHeader("Content-Type", entry.contentType);
+      res.status(200).send(fileBuffer);
+    } catch {
+      // Object vanished from the backend; re-fetch from origin.
+      startDownload(cacheKey, fetchUrl, referrer);
+      res.status(503).send("Processing");
+    }
     return;
   }
 
@@ -126,9 +132,11 @@ app.get("/refresh/:imageUrl(*)", (req, res) => {
   res.status(503).send("Processing");
 });
 
-void cacheManager.rebuildFromDisk().finally(() => {
+void cacheManager.rebuildFromStorage().finally(() => {
   app.listen(port, () => {
     // eslint-disable-next-line no-console
-    console.log(`Server running on http://localhost:${port}`);
+    console.log(
+      `Server running on http://localhost:${port} (cache backend: ${storage.backendName})`
+    );
   });
 });

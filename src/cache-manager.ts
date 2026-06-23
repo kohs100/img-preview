@@ -1,9 +1,9 @@
-import { access, mkdir, readdir, readFile, writeFile } from "fs/promises";
-import path from "path";
+import type { ObjectStorage } from "./storage";
 
 export type CacheEntry = {
   status: "processing" | "ready" | "error";
-  filePath?: string;
+  /** Storage key of the servable object (backend-agnostic). */
+  key?: string;
   contentType?: string;
   errorStatusCode?: number;
   errorMessage?: string;
@@ -12,23 +12,28 @@ export type CacheEntry = {
 
 type PersistedCacheMeta = {
   url: string;
-  filePathRelative: string;
+  /** New field. Older meta files use `filePathRelative` instead. */
+  key?: string;
+  filePathRelative?: string;
   contentType: string;
   updatedAt: number;
 };
 
 const cacheMetaSuffix = ".meta.json";
 
+/**
+ * Tracks the state of each cached image keyed by its origin URL. The actual
+ * bytes live in an {@link ObjectStorage} backend; this manager only holds the
+ * lightweight in-memory index plus the persisted `.meta.json` sidecars that
+ * let the index be rebuilt on startup.
+ */
 export class CacheManager {
-  private readonly cacheDir: string;
-
-  private readonly processedDir: string;
+  private readonly storage: ObjectStorage;
 
   private readonly cache = new Map<string, CacheEntry>();
 
-  constructor(cacheDir: string) {
-    this.cacheDir = cacheDir;
-    this.processedDir = path.join(cacheDir, "processed");
+  constructor(storage: ObjectStorage) {
+    this.storage = storage;
   }
 
   get(url: string): CacheEntry | undefined {
@@ -39,11 +44,11 @@ export class CacheManager {
     this.cache.set(url, { status: "processing", updatedAt: Date.now() });
   }
 
-  async setReady(url: string, filePath: string, contentType: string): Promise<void> {
-    await this.persistCacheMeta(url, filePath, contentType);
+  async setReady(url: string, key: string, contentType: string): Promise<void> {
+    await this.persistCacheMeta(url, key, contentType);
     this.cache.set(url, {
       status: "ready",
-      filePath,
+      key,
       contentType,
       updatedAt: Date.now(),
     });
@@ -58,22 +63,26 @@ export class CacheManager {
     });
   }
 
-  async rebuildFromDisk(): Promise<void> {
-    await mkdir(this.processedDir, { recursive: true });
-    const allFiles = await this.listFilesRecursively(this.processedDir);
-    const metaFiles = allFiles.filter((filePath) => filePath.endsWith(cacheMetaSuffix));
+  /** Rebuild the in-memory index from the `.meta.json` sidecars in storage. */
+  async rebuildFromStorage(): Promise<void> {
+    const allKeys = await this.storage.list();
+    const metaKeys = allKeys.filter((key) => key.endsWith(cacheMetaSuffix));
 
-    for (const metaFile of metaFiles) {
+    for (const metaKey of metaKeys) {
       try {
-        const raw = JSON.parse(await readFile(metaFile, "utf-8")) as unknown;
+        const raw = JSON.parse(
+          (await this.storage.read(metaKey)).toString("utf-8")
+        ) as unknown;
         if (!this.isPersistedMeta(raw)) {
           continue;
         }
-        const filePath = path.resolve(this.cacheDir, raw.filePathRelative);
-        await access(filePath);
+        const objectKey = raw.key ?? raw.filePathRelative;
+        if (!objectKey || !(await this.storage.exists(objectKey))) {
+          continue;
+        }
         this.cache.set(raw.url, {
           status: "ready",
-          filePath,
+          key: objectKey,
           contentType: raw.contentType,
           updatedAt: raw.updatedAt,
         });
@@ -83,46 +92,37 @@ export class CacheManager {
     }
   }
 
-  private getCacheMetaPath(filePath: string): string {
-    return `${filePath}${cacheMetaSuffix}`;
+  private getCacheMetaKey(key: string): string {
+    return `${key}${cacheMetaSuffix}`;
   }
 
   private async persistCacheMeta(
     url: string,
-    filePath: string,
+    key: string,
     contentType: string
   ): Promise<void> {
-    const filePathRelative = path.relative(this.cacheDir, filePath);
     const metadata: PersistedCacheMeta = {
       url,
-      filePathRelative,
+      key,
       contentType,
       updatedAt: Date.now(),
     };
-    const metaPath = this.getCacheMetaPath(filePath);
-    await writeFile(metaPath, `${JSON.stringify(metadata)}\n`);
-  }
-
-  private async listFilesRecursively(dir: string): Promise<string[]> {
-    const entries = await readdir(dir, { withFileTypes: true });
-    const nested = await Promise.all(
-      entries.map(async (entry) => {
-        const entryPath = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          return this.listFilesRecursively(entryPath);
-        }
-        return [entryPath];
-      })
+    await this.storage.write(
+      this.getCacheMetaKey(key),
+      Buffer.from(`${JSON.stringify(metadata)}\n`),
+      "application/json"
     );
-    return nested.flat();
   }
 
   private isPersistedMeta(raw: unknown): raw is PersistedCacheMeta {
     if (!raw || typeof raw !== "object") return false;
     const candidate = raw as Record<string, unknown>;
+    const hasObjectKey =
+      typeof candidate.key === "string" ||
+      typeof candidate.filePathRelative === "string";
     return (
       typeof candidate.url === "string" &&
-      typeof candidate.filePathRelative === "string" &&
+      hasObjectKey &&
       typeof candidate.contentType === "string" &&
       typeof candidate.updatedAt === "number"
     );

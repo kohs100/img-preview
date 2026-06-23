@@ -7,9 +7,11 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "migrate": "tsx src/migrate.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1075.0",
     "express": "^4.19.2",
     "sharp": "^0.33.5"
   },

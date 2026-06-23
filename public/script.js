@@ -32,14 +32,18 @@ function parseChoices(raw) {
   const out = [];
 
   for (const chunk of chunks) {
-    const rangeMatch = chunk.match(/^(-?\d+)\.\.(-?\d+)$/);
+    // Optional non-numeric prefix on the start bound, e.g. "a1..3" => a1,a2,a3.
+    // The prefix is everything before the first number (excluding a sign); an
+    // optional matching prefix on the end bound ("a1..a3") is accepted too.
+    const rangeMatch = chunk.match(/^([^\d-]*)(-?\d+)\.\.([^\d-]*)(-?\d+)$/);
     if (!rangeMatch) {
       out.push(chunk);
       continue;
     }
 
-    const startToken = rangeMatch[1];
-    const endToken = rangeMatch[2];
+    const prefix = rangeMatch[1];
+    const startToken = rangeMatch[2];
+    const endToken = rangeMatch[4];
     const start = Number(startToken);
     const end = Number(endToken);
     const step = start <= end ? 1 : -1;
@@ -56,12 +60,12 @@ function parseChoices(raw) {
 
     for (let n = start; step > 0 ? n <= end : n >= end; n += step) {
       if (!hasLeadingZeroPattern) {
-        out.push(String(n));
+        out.push(`${prefix}${n}`);
         continue;
       }
       const sign = n < 0 ? "-" : "";
       const absText = String(Math.abs(n)).padStart(padWidth, "0");
-      out.push(`${sign}${absText}`);
+      out.push(`${prefix}${sign}${absText}`);
     }
   }
 
@@ -92,7 +96,11 @@ function toCachedUrl(originUrl) {
   const params = new URLSearchParams({
     referrer: selectedReferrer(),
   });
-  return `/cached/${encodeURIComponent(originUrl)}?${params.toString()}`;
+  // The /cached/:imageUrl(*) route captures the rest of the path verbatim, and
+  // the server re-adds the https:// scheme, so we can drop the scheme and skip
+  // encoding for clean CDN URLs (alphanumerics, "/", ".", "_", "$", ...).
+  const schemeless = originUrl.replace(/^https?:\/\//i, "");
+  return `/cached/${schemeless}?${params.toString()}`;
 }
 
 async function logSubmissionRecord({
