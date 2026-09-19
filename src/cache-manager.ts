@@ -80,29 +80,36 @@ export class CacheManager {
       return;
     }
     const metaKeys = allKeys.filter((key) => key.endsWith(cacheMetaSuffix));
-
-    for (const metaKey of metaKeys) {
-      try {
-        const raw = JSON.parse(
-          (await this.storage.read(metaKey)).toString("utf-8")
-        ) as unknown;
-        if (!this.isPersistedMeta(raw)) {
-          continue;
+    const allKeySet = new Set(allKeys);
+    let nextMetaIndex = 0;
+    const workerCount = Math.min(32, metaKeys.length);
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        for (;;) {
+          const index = nextMetaIndex;
+          nextMetaIndex += 1;
+          if (index >= metaKeys.length) return;
+          try {
+            const raw = JSON.parse(
+              (await this.storage.read(metaKeys[index])).toString("utf-8")
+            ) as unknown;
+            if (!this.isPersistedMeta(raw)) continue;
+            const objectKey = raw.key ?? raw.filePathRelative;
+            // list() already returned a consistent object snapshot. Avoid one
+            // remote HEAD per sidecar, which is prohibitively slow on S3.
+            if (!objectKey || !allKeySet.has(objectKey)) continue;
+            this.cache.set(raw.url, {
+              status: "ready",
+              key: objectKey,
+              contentType: raw.contentType,
+              updatedAt: raw.updatedAt,
+            });
+          } catch {
+            // Ignore malformed metadata entries and continue startup.
+          }
         }
-        const objectKey = raw.key ?? raw.filePathRelative;
-        if (!objectKey || !(await this.storage.exists(objectKey))) {
-          continue;
-        }
-        this.cache.set(raw.url, {
-          status: "ready",
-          key: objectKey,
-          contentType: raw.contentType,
-          updatedAt: raw.updatedAt,
-        });
-      } catch {
-        // Ignore malformed metadata entries and continue startup.
       }
-    }
+    ));
   }
 
   private getCacheMetaKey(key: string): string {

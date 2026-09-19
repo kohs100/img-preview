@@ -30,12 +30,16 @@ export class S3Storage implements ObjectStorage {
 
   private readonly presignExpires: number;
 
+  private readonly requestTimeoutMs: number;
+
   constructor(config: S3BackendConfig) {
     this.bucket = config.bucket;
     this.prefix = config.prefix ? config.prefix.replace(/\/+$/, "") + "/" : "";
     this.publicUrlBase = config.publicUrlBase?.replace(/\/+$/, "");
     this.presign = config.presign;
     this.presignExpires = config.presignExpires;
+    this.requestTimeoutMs =
+      Number(process.env.S3_REQUEST_TIMEOUT_MS || "60000") || 60_000;
     this.client = new S3Client({
       region: config.region,
       endpoint: config.endpoint,
@@ -66,14 +70,21 @@ export class S3Storage implements ObjectStorage {
   }
 
   async write(key: string, data: Buffer, contentType?: string): Promise<void> {
-    await this.client.send(
-      new PutObjectCommand({
-        Bucket: this.bucket,
-        Key: this.toObjectKey(key),
-        Body: data,
-        ContentType: contentType,
-      })
-    );
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    try {
+      await this.client.send(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: this.toObjectKey(key),
+          Body: data,
+          ContentType: contentType,
+        }),
+        { abortSignal: controller.signal }
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async exists(key: string): Promise<boolean> {

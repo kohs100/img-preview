@@ -1,4 +1,8 @@
-import { backendConfigFromEnv, createStorage } from "./storage";
+import {
+  backendConfigFromEnv,
+  createStorage,
+  EncryptedStorage,
+} from "./storage";
 import type { ObjectStorage } from "./storage";
 
 type MigrateOptions = {
@@ -8,6 +12,7 @@ type MigrateOptions = {
   overwrite: boolean;
   dryRun: boolean;
   concurrency: number;
+  encryptDestination: boolean;
 };
 
 function parseArgs(argv: string[]): MigrateOptions {
@@ -51,6 +56,9 @@ function parseArgs(argv: string[]): MigrateOptions {
     overwrite: flags.get("overwrite") === "true" || flags.has("overwrite"),
     dryRun: flags.get("dry-run") === "true" || flags.has("dry-run"),
     concurrency: Number(flags.get("concurrency") ?? "8") || 8,
+    encryptDestination:
+      flags.get("encrypt-destination") === "true" ||
+      flags.has("encrypt-destination"),
   };
 }
 
@@ -58,9 +66,13 @@ async function migrateKey(
   key: string,
   source: ObjectStorage,
   dest: ObjectStorage,
-  options: MigrateOptions
+  options: MigrateOptions,
+  knownExisting?: Set<string>
 ): Promise<"copied" | "skipped"> {
-  if (!options.overwrite && (await dest.exists(key))) {
+  const alreadyExists = knownExisting
+    ? knownExisting.has(key)
+    : await dest.exists(key);
+  if (!options.overwrite && alreadyExists) {
     return "skipped";
   }
   if (options.dryRun) {
@@ -70,14 +82,41 @@ async function migrateKey(
   const contentType = key.endsWith(".meta.json")
     ? "application/json"
     : undefined;
-  await dest.write(key, data, contentType);
-  return "copied";
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      if (dest instanceof EncryptedStorage) {
+        await dest.writeDeferred(key, data);
+      } else {
+        await dest.write(key, data, contentType);
+      }
+      return "copied";
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 500));
+      }
+    }
+  }
+  throw lastError;
 }
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
-  const source = createStorage(backendConfigFromEnv(options.from));
-  const dest = createStorage(backendConfigFromEnv(options.to));
+  const source = createStorage(backendConfigFromEnv(options.from), false);
+  const rawDest = createStorage(backendConfigFromEnv(options.to), false);
+  let dest: ObjectStorage = rawDest;
+  if (options.encryptDestination) {
+    const passphrase = process.env.CACHE_ENCRYPTION_PASSPHRASE;
+    if (!passphrase) {
+      throw new Error(
+        "CACHE_ENCRYPTION_PASSPHRASE is required with --encrypt-destination"
+      );
+    }
+    const encryptedDest = new EncryptedStorage(rawDest, passphrase);
+    await encryptedDest.ensureReady();
+    dest = encryptedDest;
+  }
 
   // eslint-disable-next-line no-console
   console.log(
@@ -89,15 +128,27 @@ async function main(): Promise<void> {
   const keys = await source.list(options.prefix);
   // eslint-disable-next-line no-console
   console.log(`Found ${keys.length} objects to migrate`);
+  const knownExisting =
+    dest instanceof EncryptedStorage
+      ? await dest.findExisting(keys)
+      : undefined;
+  if (knownExisting) {
+    // eslint-disable-next-line no-console
+    console.log(`Found ${knownExisting.size} existing encrypted objects`);
+  }
 
   let copied = 0;
   let skipped = 0;
   let failed = 0;
+  const manifestKeys: string[] = [];
+  let lastReported = 0;
 
   for (let i = 0; i < keys.length; i += options.concurrency) {
     const batch = keys.slice(i, i + options.concurrency);
     const results = await Promise.allSettled(
-      batch.map((key) => migrateKey(key, source, dest, options))
+      batch.map((key) =>
+        migrateKey(key, source, dest, options, knownExisting)
+      )
     );
     for (let j = 0; j < results.length; j += 1) {
       const result = results[j];
@@ -107,14 +158,27 @@ async function main(): Promise<void> {
         console.error(`  FAIL ${batch[j]}: ${result.reason}`);
       } else if (result.value === "copied") {
         copied += 1;
+        manifestKeys.push(batch[j]);
       } else {
         skipped += 1;
+        manifestKeys.push(batch[j]);
       }
     }
+    const completed = Math.min(i + options.concurrency, keys.length);
+    if (completed === keys.length || completed - lastReported >= 1000) {
+      lastReported = completed;
+      // eslint-disable-next-line no-console
+      console.log(`  progress ${completed}/${keys.length}`);
+    }
+  }
+
+  if (dest instanceof EncryptedStorage && !options.dryRun) {
+    // Commit once: uploading a growing manifest for every object is quadratic
+    // for large caches. A failed run can be safely resumed; existing opaque
+    // objects are detected and included in the next final manifest.
+    await dest.commitManifest(manifestKeys);
     // eslint-disable-next-line no-console
-    console.log(
-      `  progress ${Math.min(i + options.concurrency, keys.length)}/${keys.length}`
-    );
+    console.log(`  encrypted manifest committed (${manifestKeys.length} keys)`);
   }
 
   // eslint-disable-next-line no-console

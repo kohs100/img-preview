@@ -1,6 +1,7 @@
 import path from "path";
 import { FsStorage } from "./fs-storage";
 import { S3Storage } from "./s3-storage";
+import { EncryptedStorage } from "./encrypted-storage";
 import type { BackendConfig, ObjectStorage } from "./types";
 
 function envBool(value: string | undefined, fallback: boolean): boolean {
@@ -46,11 +47,22 @@ export function backendConfigFromEnv(
   };
 }
 
-export function createStorage(config: BackendConfig): ObjectStorage {
+export function createStorage(
+  config: BackendConfig,
+  encrypted = envBool(process.env.CACHE_ENCRYPTION, false)
+): ObjectStorage {
+  let storage: ObjectStorage;
   if (config.kind === "fs") {
-    return new FsStorage(config.baseDir);
+    storage = new FsStorage(config.baseDir);
+  } else {
+    storage = new S3Storage(config);
   }
-  return new S3Storage(config);
+  if (!encrypted) return storage;
+  const passphrase = process.env.CACHE_ENCRYPTION_PASSPHRASE;
+  if (!passphrase) {
+    throw new Error("CACHE_ENCRYPTION_PASSPHRASE is required when CACHE_ENCRYPTION=true");
+  }
+  return new EncryptedStorage(storage, passphrase);
 }
 
 /** Convenience: build the storage backend selected by the environment. */

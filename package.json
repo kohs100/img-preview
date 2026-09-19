@@ -8,7 +8,9 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "migrate": "tsx src/migrate.ts"
+    "migrate": "tsx src/migrate.ts",
+    "encrypt-cache": "tsx src/encrypt-cache.ts",
+    "change-passphrase": "tsx src/change-passphrase.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1075.0",

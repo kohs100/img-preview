@@ -100,6 +100,8 @@ CORS 없이 동작합니다.
 | `ERROR_RETRY_MS`          | `300000`    | 캐시된 origin 에러를 재시도 없이 그대로 반환하는 기간(ms). 이보다 오래된 에러는 다음 요청에서 origin 재시도. `0`이면 비활성화(에러 영구 캐시) |
 | `CACHE_BACKEND`           | `fs`        | `fs` 또는 `s3` |
 | `CACHE_DIR`               | `cache`     | `fs` 백엔드의 베이스 디렉터리 |
+| `CACHE_ENCRYPTION`        | `false`     | `true`면 객체 본문과 논리 경로를 애플리케이션 계층에서 암호화 |
+| `CACHE_ENCRYPTION_PASSPHRASE` | —       | 서버에서 마스터키를 해제할 passphrase (`CACHE_ENCRYPTION=true`에서 필수) |
 | `S3_BUCKET`               | —           | 버킷 이름 (`s3`에서 필수) |
 | `S3_REGION`               | `us-east-1` | 리전 |
 | `S3_ENDPOINT`             | —           | S3 호환 서버의 커스텀 엔드포인트 (예: `http://localhost:9000`) |
@@ -110,6 +112,7 @@ CORS 없이 동작합니다.
 | `S3_PUBLIC_URL_BASE`      | —           | 설정 시 캐시 이미지를 이 베이스 URL의 public 오브젝트로 **302 리다이렉트** 서빙 (예: `https://cdn.example.com`, path-style이면 버킷까지 포함 `http://minio:9000/img-cache`) |
 | `S3_PRESIGN`              | `false`     | `true`면 public URL 대신 **presigned GET URL**로 302 리다이렉트 (비공개 버킷용) |
 | `S3_PRESIGN_EXPIRES`      | `300`       | presigned URL 유효시간(초) |
+| `S3_REQUEST_TIMEOUT_MS`   | `60000`     | S3 PUT 한 번의 제한시간(ms); 마이그레이션은 실패 시 3회 재시도 |
 
 ## 실행
 
@@ -129,6 +132,52 @@ npm start
 ```
 
 `http://localhost:3013/` 접속.
+
+## 비신뢰 저장소 암호화
+
+`CACHE_ENCRYPTION=true`는 랜덤 256-bit 마스터키로 모든 이미지와 메타데이터를
+AES-256-GCM 암호화합니다. 논리 key는 마스터키 기반 HMAC-SHA-256으로 변환되므로 S3에는
+원본 호스트, 경로, 확장자가 나타나지 않습니다. 브라우저는 최초 이미지 표시 때
+passphrase를 묻고, PBKDF2-SHA256(기본 600,000회)으로 S3에 저장된 마스터키 봉투를
+해제합니다. 해제된 키는 현재 페이지의 메모리에만 유지됩니다.
+AES content key와 경로 HMAC key는 HKDF-SHA256으로 마스터키에서 서로 독립적으로
+파생됩니다.
+S3 redirect가 설정된 경우 `/cached`는 암호문 URL과 원래 MIME type만 반환하며 실제
+암호문 전송은 S3/CDN이 담당합니다. redirect가 없으면 서버가 암호문을 그대로 중계하고
+복호화는 동일하게 브라우저에서 수행합니다.
+
+```bash
+CACHE_BACKEND=s3 CACHE_ENCRYPTION=true \
+CACHE_ENCRYPTION_PASSPHRASE='a long private passphrase' \
+S3_BUCKET=img-cache npm start
+```
+
+기존 평문 캐시는 서버를 정지한 상태에서 같은 백엔드 안에서 변환합니다. 각 객체는
+암호화본과 manifest 쓰기가 성공한 뒤 평문이 삭제되므로 중단 후 재실행할 수 있습니다.
+첫 실행 전 버킷 버전 관리나 별도 백업을 권장합니다. `--keep-plaintext`를 붙이면 평문을
+삭제하지 않습니다.
+
+```bash
+CACHE_BACKEND=s3 \
+CACHE_ENCRYPTION_PASSPHRASE='a long private passphrase' \
+S3_BUCKET=img-cache npm run encrypt-cache
+```
+
+passphrase 변경은 이미지 재암호화 없이 마스터키 봉투만 다시 암호화합니다. 실행 중인
+서버를 정지하고 다음 명령을 수행한 뒤 새 passphrase로 재시작합니다.
+
+```bash
+CACHE_BACKEND=s3 S3_BUCKET=img-cache \
+CACHE_ENCRYPTION_OLD_PASSPHRASE='old passphrase' \
+CACHE_ENCRYPTION_NEW_PASSPHRASE='new long passphrase' \
+npm run change-passphrase
+```
+
+키 봉투와 암호화 manifest의 고정 bootstrap 객체명, 객체 개수·크기·접근 시각은 저장소에
+노출됩니다. 실제 데이터 경로와 manifest 내용은 노출되지 않습니다. 브라우저 Web Crypto는
+HTTPS(또는 localhost)에서만 사용할 수 있습니다.
+최초 키 봉투 생성은 단일 서버 인스턴스로 수행해야 합니다. 잘못된 passphrase나 손상된
+키 봉투가 감지되면 서버는 평문 fallback 없이 시작에 실패합니다.
 
 ## 백엔드 간 마이그레이션
 
@@ -155,6 +204,7 @@ npm run migrate -- s3 fs
 | `--overwrite`        | 대상에 이미 존재하는 오브젝트를 덮어씀 (기본: 건너뜀) |
 | `--dry-run`          | 쓰기 없이 나열/카운트만 수행 |
 | `--concurrency <n>`  | 배치당 병렬 복사 수 (기본 `8`) |
+| `--encrypt-destination` | 목적지에 AES-GCM 암호문과 HMAC 기반 opaque key로 기록 |
 
 마이그레이션은 멱등적입니다 — 재실행하면 `--overwrite`가 없는 한 대상에 이미 존재하는
 오브젝트를 건너뜁니다. key가 백엔드 간 동일하므로, 마이그레이션된 캐시는 별도의

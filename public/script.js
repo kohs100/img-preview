@@ -17,6 +17,118 @@ let currentView = {
 };
 const POLL_INTERVAL_MS = 1200;
 const MAX_POLL_RETRY = 60;
+const textEncoder = new TextEncoder();
+let encryptionConfigPromise = null;
+let masterKeyPromise = null;
+
+function decodeBase64(value) {
+  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+}
+
+function encryptionConfig() {
+  if (!encryptionConfigPromise) {
+    encryptionConfigPromise = fetch("/api/encryption/config", { cache: "no-store" })
+      .then((response) => {
+        if (!response.ok) throw new Error("Encryption configuration is unavailable");
+        return response.json();
+      });
+  }
+  return encryptionConfigPromise;
+}
+
+async function unlockMasterKey(envelope) {
+  if (
+    envelope.version !== 1 ||
+    envelope.kdf !== "PBKDF2-SHA256" ||
+    !Number.isSafeInteger(envelope.iterations) ||
+    envelope.iterations < 100000 ||
+    envelope.iterations > 5000000
+  ) {
+    throw new Error("Unsupported master-key envelope");
+  }
+  for (;;) {
+    const passphrase = window.prompt("Cache passphrase");
+    if (passphrase === null) throw new Error("Passphrase entry cancelled");
+    try {
+      const passwordKey = await crypto.subtle.importKey(
+        "raw",
+        textEncoder.encode(passphrase),
+        "PBKDF2",
+        false,
+        ["deriveKey"]
+      );
+      const wrappingKey = await crypto.subtle.deriveKey(
+        {
+          name: "PBKDF2",
+          hash: "SHA-256",
+          salt: decodeBase64(envelope.salt),
+          iterations: envelope.iterations,
+        },
+        passwordKey,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["decrypt"]
+      );
+      const iv = decodeBase64(envelope.iv);
+      const ciphertext = decodeBase64(envelope.ciphertext);
+      const rawMasterKey = await crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv,
+          additionalData: textEncoder.encode("img-preview-master-key-v1"),
+          tagLength: 128,
+        },
+        wrappingKey,
+        ciphertext
+      );
+      const hkdfKey = await crypto.subtle.importKey(
+        "raw",
+        rawMasterKey,
+        "HKDF",
+        false,
+        ["deriveKey"]
+      );
+      return crypto.subtle.deriveKey(
+        {
+          name: "HKDF",
+          hash: "SHA-256",
+          salt: textEncoder.encode("img-preview-v1"),
+          info: textEncoder.encode("content-encryption"),
+        },
+        hkdfKey,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["decrypt"]
+      );
+    } catch {
+      window.alert("Wrong passphrase or damaged key envelope.");
+    }
+  }
+}
+
+async function decryptImagePayload(payload) {
+  const bytes = new Uint8Array(payload);
+  if (
+    bytes.length < 32 ||
+    bytes[0] !== 0x49 || bytes[1] !== 0x50 ||
+    bytes[2] !== 0x56 || bytes[3] !== 0x31
+  ) {
+    throw new Error("Invalid encrypted image format");
+  }
+  const config = await encryptionConfig();
+  if (!masterKeyPromise) masterKeyPromise = unlockMasterKey(config.envelope);
+  const key = await masterKeyPromise;
+  return crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: bytes.slice(4, 16),
+      additionalData: bytes.slice(0, 4),
+      tagLength: 128,
+    },
+    key,
+    bytes.slice(16)
+  );
+}
 
 function setStatus(message, isError = false) {
   statusEl.textContent = message;
@@ -134,6 +246,7 @@ async function logSubmissionRecord({
 }
 
 async function setImagePolling(img, cachedUrl) {
+  const config = await encryptionConfig();
   for (let retryCount = 0; retryCount <= MAX_POLL_RETRY; retryCount += 1) {
     let response;
     try {
@@ -143,18 +256,38 @@ async function setImagePolling(img, cachedUrl) {
     }
 
     if (response && response.status === 200) {
-      const blob = await response.blob();
+      let blob;
+      if (config.enabled) {
+        let encryptedResponse = response;
+        let contentType = response.headers.get("X-Image-Content-Type") || "";
+        if ((response.headers.get("content-type") || "").includes("application/json")) {
+          const descriptor = await response.json();
+          if (!descriptor.encrypted || !descriptor.url) {
+            throw new Error("Invalid encrypted image descriptor");
+          }
+          contentType = descriptor.contentType || "";
+          encryptedResponse = await fetch(descriptor.url, { cache: "no-store" });
+          if (!encryptedResponse.ok) throw new Error("Encrypted image download failed");
+        }
+        const plaintext = await decryptImagePayload(
+          await encryptedResponse.arrayBuffer()
+        );
+        blob = new Blob([plaintext], { type: contentType });
+      } else {
+        blob = await response.blob();
+      }
       const objectUrl = URL.createObjectURL(blob);
       img.src = objectUrl;
-      return;
+      return objectUrl;
     }
 
     if (!response || response.status !== 503) {
-      return;
+      return null;
     }
 
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
+  return null;
 }
 
 function clearList() {
@@ -229,7 +362,13 @@ function makeCard({ src, label, onClick }) {
 
   const img = document.createElement("img");
   img.loading = "lazy";
-  setImagePolling(img, src);
+  void setImagePolling(img, src).then((objectUrl) => {
+    if (objectUrl && mediaWrapper instanceof HTMLAnchorElement) {
+      mediaWrapper.href = objectUrl;
+    }
+  }).catch((error) => {
+    img.alt = error instanceof Error ? error.message : "Image decryption failed";
+  });
   img.alt = label;
 
   const meta = document.createElement("div");

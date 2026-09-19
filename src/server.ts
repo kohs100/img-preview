@@ -1,7 +1,7 @@
 import express from "express";
 import { CacheManager } from "./cache-manager";
 import { DownloadManager, UpstreamHttpError } from "./download-manager";
-import { backendConfigFromEnv, createStorage } from "./storage";
+import { backendConfigFromEnv, createStorage, EncryptedStorage } from "./storage";
 
 const app = express();
 const port = process.env.PORT ? Number(process.env.PORT) : 3013;
@@ -32,6 +32,19 @@ app.post("/api/submissions", (req, res) => {
     `[${timestamp}] frontend-submission ${JSON.stringify(payload)}`
   );
   res.status(204).end();
+});
+
+app.get("/api/encryption/config", async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (!(storage instanceof EncryptedStorage)) {
+    res.json({ enabled: false });
+    return;
+  }
+  try {
+    res.json({ enabled: true, envelope: await storage.getMasterKeyEnvelope() });
+  } catch {
+    res.status(503).json({ error: "Encryption key is unavailable" });
+  }
 });
 
 function normalizeUrl(raw: string): string {
@@ -109,11 +122,27 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
       }
     }
     if (redirectUrl) {
+      if (storage instanceof EncryptedStorage) {
+        res.setHeader("Cache-Control", "no-store");
+        res.json({
+          encrypted: true,
+          url: redirectUrl,
+          contentType: entry.contentType,
+        });
+        return;
+      }
       res.redirect(302, redirectUrl);
       return;
     }
 
     try {
+      if (storage instanceof EncryptedStorage) {
+        const encrypted = await storage.readEncrypted(entry.key);
+        res.setHeader("Content-Type", "application/octet-stream");
+        res.setHeader("X-Image-Content-Type", entry.contentType);
+        res.status(200).send(encrypted);
+        return;
+      }
       const fileBuffer = await storage.read(entry.key);
       res.setHeader("Content-Type", entry.contentType);
       res.status(200).send(fileBuffer);
@@ -159,11 +188,21 @@ app.get("/refresh/:imageUrl(*)", (req, res) => {
   res.status(503).send("Processing");
 });
 
-void cacheManager.rebuildFromStorage().finally(() => {
+async function startServer(): Promise<void> {
+  // Unlike an ordinary index-listing failure, a bad encryption passphrase
+  // must fail closed instead of starting a server that can never serve data.
+  if (storage instanceof EncryptedStorage) await storage.ensureReady();
+  await cacheManager.rebuildFromStorage();
   app.listen(port, () => {
     // eslint-disable-next-line no-console
     console.log(
       `Server running on http://localhost:${port} (cache backend: ${storage.backendName})`
     );
   });
+}
+
+void startServer().catch((error: unknown) => {
+  // eslint-disable-next-line no-console
+  console.error(error instanceof Error ? error.message : error);
+  process.exitCode = 1;
 });

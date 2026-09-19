@@ -6,6 +6,7 @@ export type {
 } from "./types";
 export { FsStorage } from "./fs-storage";
 export { S3Storage } from "./s3-storage";
+export { EncryptedStorage } from "./encrypted-storage";
 export {
   backendConfigFromEnv,
   createStorage,
