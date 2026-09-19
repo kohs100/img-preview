@@ -45,6 +45,31 @@ form {
   gap: 12px;
 }
 
+.encryption-panel {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.encryption-panel h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+
+.encryption-form {
+  margin-top: 12px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.storage-warning {
+  margin-top: 10px;
+  font-size: 12px;
+}
+
 label {
   display: flex;
   flex-direction: column;

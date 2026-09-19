@@ -8,6 +8,12 @@ const statusEl = document.getElementById("status");
 const modeLabelEl = document.getElementById("modeLabel");
 const listEl = document.getElementById("list");
 const backButton = document.getElementById("backButton");
+const encryptionPanel = document.getElementById("encryptionPanel");
+const encryptionForm = document.getElementById("encryptionForm");
+const encryptionPassphrase = document.getElementById("encryptionPassphrase");
+const encryptionStatus = document.getElementById("encryptionStatus");
+const savePassphraseButton = document.getElementById("savePassphraseButton");
+const forgetPassphraseButton = document.getElementById("forgetPassphraseButton");
 
 let state = null;
 let currentView = {
@@ -18,8 +24,10 @@ let currentView = {
 const POLL_INTERVAL_MS = 1200;
 const MAX_POLL_RETRY = 60;
 const textEncoder = new TextEncoder();
+const PASSPHRASE_STORAGE_KEY = "img-preview.cache-passphrase.v1";
 let encryptionConfigPromise = null;
 let masterKeyPromise = null;
+let pendingUnlockResolve = null;
 
 function decodeBase64(value) {
   return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
@@ -31,12 +39,53 @@ function encryptionConfig() {
       .then((response) => {
         if (!response.ok) throw new Error("Encryption configuration is unavailable");
         return response.json();
+      })
+      .then((config) => {
+        encryptionPanel.hidden = !config.enabled;
+        if (config.enabled) updateEncryptionStatus();
+        return config;
       });
   }
   return encryptionConfigPromise;
 }
 
-async function unlockMasterKey(envelope) {
+function getStoredPassphrase() {
+  try {
+    return localStorage.getItem(PASSPHRASE_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function storePassphrase(passphrase) {
+  try {
+    localStorage.setItem(PASSPHRASE_STORAGE_KEY, passphrase);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function forgetStoredPassphrase() {
+  try {
+    localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
+  } catch {
+    // Storage may be disabled; the in-memory key is still cleared below.
+  }
+}
+
+function updateEncryptionStatus(message, isError = false) {
+  if (message) {
+    encryptionStatus.textContent = message;
+  } else if (getStoredPassphrase()) {
+    encryptionStatus.textContent = "Passphrase remembered on this browser.";
+  } else {
+    encryptionStatus.textContent = "Locked. Enter the passphrase to decrypt images.";
+  }
+  encryptionStatus.className = isError ? "error" : "";
+}
+
+async function deriveMasterKey(envelope, passphrase) {
   if (
     envelope.version !== 1 ||
     envelope.kdf !== "PBKDF2-SHA256" ||
@@ -46,64 +95,79 @@ async function unlockMasterKey(envelope) {
   ) {
     throw new Error("Unsupported master-key envelope");
   }
-  for (;;) {
-    const passphrase = window.prompt("Cache passphrase");
-    if (passphrase === null) throw new Error("Passphrase entry cancelled");
+  const passwordKey = await crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(passphrase),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  const wrappingKey = await crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt: decodeBase64(envelope.salt),
+      iterations: envelope.iterations,
+    },
+    passwordKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+  const iv = decodeBase64(envelope.iv);
+  const ciphertext = decodeBase64(envelope.ciphertext);
+  const rawMasterKey = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv,
+      additionalData: textEncoder.encode("img-preview-master-key-v1"),
+      tagLength: 128,
+    },
+    wrappingKey,
+    ciphertext
+  );
+  const hkdfKey = await crypto.subtle.importKey(
+    "raw",
+    rawMasterKey,
+    "HKDF",
+    false,
+    ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: textEncoder.encode("img-preview-v1"),
+      info: textEncoder.encode("content-encryption"),
+    },
+    hkdfKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+}
+
+async function obtainMasterKey() {
+  const config = await encryptionConfig();
+  const saved = getStoredPassphrase();
+  if (saved) {
     try {
-      const passwordKey = await crypto.subtle.importKey(
-        "raw",
-        textEncoder.encode(passphrase),
-        "PBKDF2",
-        false,
-        ["deriveKey"]
-      );
-      const wrappingKey = await crypto.subtle.deriveKey(
-        {
-          name: "PBKDF2",
-          hash: "SHA-256",
-          salt: decodeBase64(envelope.salt),
-          iterations: envelope.iterations,
-        },
-        passwordKey,
-        { name: "AES-GCM", length: 256 },
-        false,
-        ["decrypt"]
-      );
-      const iv = decodeBase64(envelope.iv);
-      const ciphertext = decodeBase64(envelope.ciphertext);
-      const rawMasterKey = await crypto.subtle.decrypt(
-        {
-          name: "AES-GCM",
-          iv,
-          additionalData: textEncoder.encode("img-preview-master-key-v1"),
-          tagLength: 128,
-        },
-        wrappingKey,
-        ciphertext
-      );
-      const hkdfKey = await crypto.subtle.importKey(
-        "raw",
-        rawMasterKey,
-        "HKDF",
-        false,
-        ["deriveKey"]
-      );
-      return crypto.subtle.deriveKey(
-        {
-          name: "HKDF",
-          hash: "SHA-256",
-          salt: textEncoder.encode("img-preview-v1"),
-          info: textEncoder.encode("content-encryption"),
-        },
-        hkdfKey,
-        { name: "AES-GCM", length: 256 },
-        false,
-        ["decrypt"]
-      );
+      const key = await deriveMasterKey(config.envelope, saved);
+      updateEncryptionStatus("Unlocked with the remembered passphrase.");
+      return key;
     } catch {
-      window.alert("Wrong passphrase or damaged key envelope.");
+      forgetStoredPassphrase();
+      updateEncryptionStatus(
+        "Saved passphrase is no longer valid. Enter the current passphrase.",
+        true
+      );
     }
   }
+  encryptionPanel.hidden = false;
+  encryptionPassphrase.focus();
+  return new Promise((resolve) => {
+    pendingUnlockResolve = resolve;
+  });
 }
 
 async function decryptImagePayload(payload) {
@@ -116,7 +180,7 @@ async function decryptImagePayload(payload) {
     throw new Error("Invalid encrypted image format");
   }
   const config = await encryptionConfig();
-  if (!masterKeyPromise) masterKeyPromise = unlockMasterKey(config.envelope);
+  if (!masterKeyPromise) masterKeyPromise = obtainMasterKey();
   const key = await masterKeyPromise;
   return crypto.subtle.decrypt(
     {
@@ -490,6 +554,50 @@ backButton.addEventListener("click", () => {
   renderMainList();
 });
 
+encryptionForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const passphrase = encryptionPassphrase.value;
+  if (!passphrase) {
+    updateEncryptionStatus("Enter the cache passphrase.", true);
+    return;
+  }
+
+  savePassphraseButton.disabled = true;
+  updateEncryptionStatus("Validating passphrase…");
+  try {
+    const config = await encryptionConfig();
+    const key = await deriveMasterKey(config.envelope, passphrase);
+    const remembered = storePassphrase(passphrase);
+    masterKeyPromise = Promise.resolve(key);
+    if (pendingUnlockResolve) {
+      pendingUnlockResolve(key);
+      pendingUnlockResolve = null;
+    }
+    encryptionPassphrase.value = "";
+    updateEncryptionStatus(
+      remembered
+        ? "Unlocked. Passphrase remembered on this browser."
+        : "Unlocked for this page, but browser storage is unavailable.",
+      !remembered
+    );
+  } catch {
+    updateEncryptionStatus("Wrong passphrase or damaged key envelope.", true);
+    encryptionPassphrase.select();
+  } finally {
+    savePassphraseButton.disabled = false;
+  }
+});
+
+forgetPassphraseButton.addEventListener("click", () => {
+  forgetStoredPassphrase();
+  masterKeyPromise = null;
+  encryptionPassphrase.value = "";
+  updateEncryptionStatus(
+    "Forgotten and locked. Already displayed images remain visible."
+  );
+  encryptionPassphrase.focus();
+});
+
 function hydrateFromQuery() {
   restoreFormFromQuery();
   const rawCharacter = characterInput.value.trim();
@@ -539,3 +647,7 @@ function hydrateFromQuery() {
 }
 
 hydrateFromQuery();
+void encryptionConfig().catch(() => {
+  encryptionPanel.hidden = false;
+  updateEncryptionStatus("Could not load encryption configuration.", true);
+});

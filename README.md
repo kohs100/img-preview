@@ -147,9 +147,14 @@ passphrase를 묻고, PBKDF2-SHA256(기본 600,000회)으로 S3에 저장된 마
 해제합니다. 해제된 키는 현재 페이지의 메모리에만 유지됩니다.
 AES content key와 경로 HMAC key는 HKDF-SHA256으로 마스터키에서 서로 독립적으로
 파생됩니다.
+브라우저의 Encryption key 패널에서 passphrase를 검증해 `localStorage`에 기억하거나
+삭제하고 잠글 수 있습니다. 같은 origin에서 실행되는 JavaScript는 저장된 passphrase를
+읽을 수 있으므로 개인용·신뢰 기기에서만 기억 기능을 사용해야 합니다.
 S3 redirect가 설정된 경우 `/cached`는 암호문 URL과 원래 MIME type만 반환하며 실제
 암호문 전송은 S3/CDN이 담당합니다. redirect가 없으면 서버가 암호문을 그대로 중계하고
 복호화는 동일하게 브라우저에서 수행합니다.
+`S3_PRESIGN=true`이면 `S3_PUBLIC_URL_BASE`는 사용되지 않으며, HTTPS
+`S3_BROWSER_ENDPOINT`만으로 브라우저 직접 전송을 구성할 수 있습니다.
 
 ```bash
 CACHE_BACKEND=s3 CACHE_ENCRYPTION=true \

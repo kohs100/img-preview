@@ -68,6 +68,36 @@
         </div>
       </form>
 
+      <section id="encryptionPanel" class="encryption-panel" hidden>
+        <div>
+          <h2>Encryption key</h2>
+          <p id="encryptionStatus">Checking saved passphrase…</p>
+        </div>
+        <form id="encryptionForm" class="encryption-form">
+          <label>
+            Cache passphrase
+            <input
+              id="encryptionPassphrase"
+              type="password"
+              autocomplete="current-password"
+              placeholder="Enter once on this browser"
+            />
+          </label>
+          <div class="row">
+            <button type="submit" id="savePassphraseButton">
+              Unlock and remember
+            </button>
+            <button type="button" id="forgetPassphraseButton" class="secondary">
+              Forget and lock
+            </button>
+          </div>
+        </form>
+        <p class="storage-warning">
+          The passphrase is stored in this origin's localStorage. Any script
+          running on this origin can read it; use this only on a trusted device.
+        </p>
+      </section>
+
       <div id="status"></div>
       <div id="modeLabel"></div>
       <section id="list" aria-live="polite"></section>
