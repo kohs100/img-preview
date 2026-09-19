@@ -190,7 +190,12 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
       sendProcessing(res, cacheManager.getCached(cacheKey));
       return;
     }
-    res.status(entry.errorStatusCode ?? 502).send(entry.errorMessage || "Upstream fetch failed");
+    res.status(entry.errorStatusCode ?? 502).json({
+      status: "error",
+      phase: "failed",
+      errorStatusCode: entry.errorStatusCode ?? 502,
+      message: entry.errorMessage || "Upstream fetch failed",
+    });
     return;
   }
 

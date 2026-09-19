@@ -320,7 +320,17 @@ function formatProgress(progress) {
     transferring: "Downloading image",
     decrypting: "Decrypting",
     ready: "Ready",
+    failed: "Failed",
   };
+  if (progress.phase === "failed") {
+    const status = Number.isInteger(progress.errorStatusCode)
+      ? ` (${progress.errorStatusCode})`
+      : "";
+    const message = progress.message
+      ? `: ${String(progress.message).slice(0, 120)}`
+      : "";
+    return `Failed${status}${message}`;
+  }
   const label = labels[progress.phase] || "Processing";
   if (Number.isFinite(progress.percent)) {
     return `${label}… ${progress.percent}%`;
@@ -423,6 +433,20 @@ async function setImagePolling(img, cachedUrl, onProgress) {
     } else if (!response) {
       onProgress({ phase: "queued" });
     } else {
+      let errorStatusCode = response.status;
+      let message = `Request failed with HTTP ${response.status}`;
+      try {
+        if ((response.headers.get("content-type") || "").includes("application/json")) {
+          const payload = await response.json();
+          errorStatusCode = payload.errorStatusCode ?? response.status;
+          message = payload.message || message;
+        } else {
+          message = (await response.text()) || message;
+        }
+      } catch {
+        // Keep the HTTP fallback message.
+      }
+      onProgress({ phase: "failed", errorStatusCode, message });
       return null;
     }
 
@@ -509,6 +533,7 @@ function makeCard({ src, label, onClick, openImage = false }) {
   const onProgress = (progress) => {
     loadStatus.textContent = formatProgress(progress);
     loadStatus.hidden = progress.phase === "ready";
+    loadStatus.classList.toggle("error", progress.phase === "failed");
   };
   void setImagePolling(img, src, onProgress).then((objectUrl) => {
     if (
