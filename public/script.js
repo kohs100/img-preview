@@ -411,7 +411,7 @@ function buildTypeViewHref(characterIndex, clothesIndex) {
   return `${url.pathname}?${params.toString()}`;
 }
 
-function makeCard({ src, label, onClick }) {
+function makeCard({ src, label, onClick, openImage = false }) {
   const card = document.createElement("article");
   card.className = "item";
 
@@ -427,7 +427,11 @@ function makeCard({ src, label, onClick }) {
   const img = document.createElement("img");
   img.loading = "lazy";
   void setImagePolling(img, src).then((objectUrl) => {
-    if (objectUrl && mediaWrapper instanceof HTMLAnchorElement) {
+    if (
+      openImage &&
+      objectUrl &&
+      mediaWrapper instanceof HTMLAnchorElement
+    ) {
       mediaWrapper.href = objectUrl;
     }
   }).catch((error) => {
@@ -496,7 +500,8 @@ function renderTypeList(characterIndex, clothesIndex) {
     const card = makeCard({
       src: cachedUrl,
       label: tyValue,
-      onClick: cachedUrl
+      onClick: cachedUrl,
+      openImage: true
     });
     listEl.appendChild(card);
   }
