@@ -20,6 +20,8 @@ export class S3Storage implements ObjectStorage {
 
   private readonly client: S3Client;
 
+  private readonly browserClient: S3Client;
+
   private readonly bucket: string;
 
   private readonly prefix: string;
@@ -40,9 +42,8 @@ export class S3Storage implements ObjectStorage {
     this.presignExpires = config.presignExpires;
     this.requestTimeoutMs =
       Number(process.env.S3_REQUEST_TIMEOUT_MS || "60000") || 60_000;
-    this.client = new S3Client({
+    const clientOptions = {
       region: config.region,
-      endpoint: config.endpoint,
       forcePathStyle: config.forcePathStyle,
       credentials:
         config.accessKeyId && config.secretAccessKey
@@ -51,6 +52,14 @@ export class S3Storage implements ObjectStorage {
               secretAccessKey: config.secretAccessKey,
             }
           : undefined,
+    };
+    this.client = new S3Client({
+      ...clientOptions,
+      endpoint: config.endpoint,
+    });
+    this.browserClient = new S3Client({
+      ...clientOptions,
+      endpoint: config.browserEndpoint ?? config.endpoint,
     });
   }
 
@@ -142,7 +151,7 @@ export class S3Storage implements ObjectStorage {
     }
     if (this.presign) {
       return getSignedUrl(
-        this.client,
+        this.browserClient,
         new GetObjectCommand({ Bucket: this.bucket, Key: objectKey }),
         { expiresIn: this.presignExpires }
       );

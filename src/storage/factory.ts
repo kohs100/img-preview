@@ -38,6 +38,7 @@ export function backendConfigFromEnv(
     bucket,
     region: process.env.S3_REGION || "us-east-1",
     endpoint: process.env.S3_ENDPOINT || undefined,
+    browserEndpoint: process.env.S3_BROWSER_ENDPOINT || undefined,
     accessKeyId: process.env.S3_ACCESS_KEY_ID || undefined,
     secretAccessKey: process.env.S3_SECRET_ACCESS_KEY || undefined,
     forcePathStyle: envBool(process.env.S3_FORCE_PATH_STYLE, true),

@@ -51,6 +51,8 @@ export type S3BackendConfig = {
   region: string;
   /** Custom endpoint for S3-compatible services (MinIO, R2, etc.). */
   endpoint?: string;
+  /** HTTPS endpoint embedded in browser-facing presigned URLs. */
+  browserEndpoint?: string;
   accessKeyId?: string;
   secretAccessKey?: string;
   /** Required by most non-AWS S3-compatible servers. */

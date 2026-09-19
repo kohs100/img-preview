@@ -106,6 +106,7 @@ CORS 없이 동작합니다.
 | `S3_BUCKET`               | —           | 버킷 이름 (`s3`에서 필수) |
 | `S3_REGION`               | `us-east-1` | 리전 |
 | `S3_ENDPOINT`             | —           | S3 호환 서버의 커스텀 엔드포인트 (예: `http://localhost:9000`) |
+| `S3_BROWSER_ENDPOINT`     | `S3_ENDPOINT` | 브라우저용 presigned URL에 넣을 HTTPS endpoint. 서버 내부 endpoint와 분리 가능 |
 | `S3_ACCESS_KEY_ID`        | —           | 미설정 시 기본 AWS 자격증명 체인 사용 |
 | `S3_SECRET_ACCESS_KEY`    | —           | — |
 | `S3_FORCE_PATH_STYLE`     | `true`      | path-style 주소 방식 (대부분의 비-AWS 서버에 필요) |
