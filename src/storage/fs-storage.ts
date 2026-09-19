@@ -24,7 +24,13 @@ export class FsStorage implements ObjectStorage {
     return readFile(this.toPath(key));
   }
 
-  async write(key: string, data: Buffer): Promise<void> {
+  async write(
+    key: string,
+    data: Buffer,
+    _contentType?: string,
+    onPhase?: (phase: "encrypting" | "uploading") => void
+  ): Promise<void> {
+    onPhase?.("uploading");
     const filePath = this.toPath(key);
     await mkdir(path.dirname(filePath), { recursive: true });
     await writeFile(filePath, data);

@@ -91,10 +91,15 @@ export class EncryptedStorage implements ObjectStorage {
     return decryptObject(await this.inner.read(this.physicalKey(key)), this.masterKey);
   }
 
-  async write(key: string, data: Buffer): Promise<void> {
+  async write(
+    key: string,
+    data: Buffer,
+    _contentType?: string,
+    onPhase?: (phase: "encrypting" | "uploading") => void
+  ): Promise<void> {
     await this.ensureManifestLoaded();
     const wasNew = !this.logicalKeys.has(key);
-    await this.writeDeferred(key, data);
+    await this.writeDeferred(key, data, onPhase);
     if (wasNew) {
       this.manifestWrite = this.manifestWrite
         .catch(() => undefined)
@@ -112,12 +117,19 @@ export class EncryptedStorage implements ObjectStorage {
    * Write an encrypted object and update the in-memory index without uploading
    * the manifest. Bulk migrations call commitManifest once after all objects.
    */
-  async writeDeferred(key: string, data: Buffer): Promise<void> {
+  async writeDeferred(
+    key: string,
+    data: Buffer,
+    onPhase?: (phase: "encrypting" | "uploading") => void
+  ): Promise<void> {
     await this.ready;
+    onPhase?.("encrypting");
+    const encrypted = encryptObject(data, this.masterKey);
     await this.inner.write(
       this.physicalKey(key),
-      encryptObject(data, this.masterKey),
-      "application/octet-stream"
+      encrypted,
+      "application/octet-stream",
+      onPhase
     );
     this.logicalKeys.add(key);
   }

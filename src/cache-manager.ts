@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import type { ProcessingProgress } from "./download-manager";
 import type { ObjectStorage } from "./storage";
 
 export type CacheEntry = {
@@ -8,6 +9,9 @@ export type CacheEntry = {
   errorStatusCode?: number;
   errorMessage?: string;
   updatedAt: number;
+  phase?: ProcessingProgress["phase"];
+  completedBytes?: number;
+  totalBytes?: number;
 };
 
 export type PersistedCacheMeta = {
@@ -54,7 +58,21 @@ export class CacheManager {
   }
 
   setProcessing(url: string): void {
-    this.cache.set(url, { status: "processing", updatedAt: Date.now() });
+    this.cache.set(url, {
+      status: "processing",
+      phase: "queued",
+      updatedAt: Date.now(),
+    });
+  }
+
+  updateProgress(url: string, progress: ProcessingProgress): void {
+    const current = this.cache.get(url);
+    if (current?.status !== "processing") return;
+    this.cache.set(url, {
+      status: "processing",
+      ...progress,
+      updatedAt: Date.now(),
+    });
   }
 
   claimProcessing(url: string): boolean {

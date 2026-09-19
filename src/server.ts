@@ -68,8 +68,11 @@ function toCacheKey(url: string): string {
 function startDownload(cacheKey: string, fetchUrl: string, referrer: string): void {
   cacheManager.setProcessing(cacheKey);
   downloadManager
-    .downloadAndProcess(fetchUrl, referrer)
+    .downloadAndProcess(fetchUrl, referrer, (progress) => {
+      cacheManager.updateProgress(cacheKey, progress);
+    })
     .then(({ key, contentType }) => {
+      cacheManager.updateProgress(cacheKey, { phase: "indexing" });
       return cacheManager.setReady(cacheKey, key, contentType);
     })
     .catch((error: unknown) => {
@@ -79,6 +82,23 @@ function startDownload(cacheKey: string, fetchUrl: string, referrer: string): vo
         error instanceof Error ? error.message : "Upstream fetch failed";
       cacheManager.setError(cacheKey, errorStatusCode, errorMessage);
     });
+}
+
+function sendProcessing(res: express.Response, entry?: ReturnType<CacheManager["getCached"]>): void {
+  const completedBytes = entry?.completedBytes;
+  const totalBytes = entry?.totalBytes;
+  const percent =
+    completedBytes !== undefined && totalBytes !== undefined && totalBytes > 0
+      ? Math.min(100, Math.round((completedBytes / totalBytes) * 100))
+      : undefined;
+  res.setHeader("Retry-After", "1");
+  res.status(503).json({
+    status: "processing",
+    phase: entry?.phase ?? "queued",
+    completedBytes,
+    totalBytes,
+    percent,
+  });
 }
 
 function resolveRequestParams(req: express.Request): {
@@ -150,13 +170,13 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
     } catch {
       // Object vanished from the backend; re-fetch from origin.
       startDownload(cacheKey, fetchUrl, referrer);
-      res.status(503).send("Processing");
+      sendProcessing(res, cacheManager.getCached(cacheKey));
     }
     return;
   }
 
   if (entry?.status === "processing") {
-    res.status(503).send("Processing");
+    sendProcessing(res, entry);
     return;
   }
 
@@ -165,7 +185,7 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
     if (errorRetryMs > 0 && errorAgeMs >= errorRetryMs) {
       // Cached error is stale; retry the origin instead of serving it again.
       startDownload(cacheKey, fetchUrl, referrer);
-      res.status(503).send("Processing");
+      sendProcessing(res, cacheManager.getCached(cacheKey));
       return;
     }
     res.status(entry.errorStatusCode ?? 502).send(entry.errorMessage || "Upstream fetch failed");
@@ -176,7 +196,7 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
   if (cacheManager.claimProcessing(cacheKey)) {
     startDownload(cacheKey, fetchUrl, referrer);
   }
-  res.status(503).send("Processing");
+  sendProcessing(res, cacheManager.getCached(cacheKey));
 });
 
 app.get("/refresh/:imageUrl(*)", (req, res) => {
@@ -188,7 +208,7 @@ app.get("/refresh/:imageUrl(*)", (req, res) => {
 
   const { cacheKey, fetchUrl, referrer } = params;
   startDownload(cacheKey, fetchUrl, referrer);
-  res.status(503).send("Processing");
+  sendProcessing(res, cacheManager.getCached(cacheKey));
 });
 
 async function startServer(): Promise<void> {

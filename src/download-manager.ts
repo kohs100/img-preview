@@ -1,6 +1,20 @@
 import sharp from "sharp";
 import type { ObjectStorage } from "./storage";
 
+export type ProcessingPhase =
+  | "queued"
+  | "downloading"
+  | "transforming"
+  | "encrypting"
+  | "uploading"
+  | "indexing";
+
+export type ProcessingProgress = {
+  phase: ProcessingPhase;
+  completedBytes?: number;
+  totalBytes?: number;
+};
+
 export class UpstreamHttpError extends Error {
   statusCode: number;
 
@@ -31,16 +45,20 @@ export class DownloadManager {
 
   async downloadAndProcess(
     url: string,
-    referrer: string
+    referrer: string,
+    onProgress: (progress: ProcessingProgress) => void = () => undefined
   ): Promise<{ key: string; contentType: string }> {
+    onProgress({ phase: "queued" });
     await this.throttleOriginRequest(url);
     const res = await fetch(url, { referrer });
     if (!res.ok) {
       throw new UpstreamHttpError(res.status, `Upstream fetch failed: ${res.status}`);
     }
 
-    const arrayBuffer = await res.arrayBuffer();
-    const inputBuffer = Buffer.from(arrayBuffer);
+    const totalHeader = Number(res.headers.get("content-length"));
+    const totalBytes =
+      Number.isFinite(totalHeader) && totalHeader >= 0 ? totalHeader : undefined;
+    const inputBuffer = await this.readResponseBody(res, totalBytes, onProgress);
     const headerType = res.headers.get("content-type") || "";
     const sourceExt = this.extensionFromUrl(url) || this.extensionFromContentType(headerType);
     const isPng = headerType.includes("image/png") || url.toLowerCase().endsWith(".png");
@@ -48,15 +66,56 @@ export class DownloadManager {
     const { sourceKey, processedKey } = this.buildCacheKeys(url, sourceExt, processedExt);
 
     const sourceContentType = headerType || "application/octet-stream";
-    await this.storage.write(sourceKey, inputBuffer, sourceContentType);
+    await this.storage.write(
+      sourceKey,
+      inputBuffer,
+      sourceContentType,
+      (phase) => onProgress({ phase })
+    );
 
     if (!isPng) {
       return { key: sourceKey, contentType: sourceContentType };
     }
 
+    onProgress({ phase: "transforming" });
     const outputBuffer = await sharp(inputBuffer).webp({ quality: 80 }).toBuffer();
-    await this.storage.write(processedKey, outputBuffer, "image/webp");
+    await this.storage.write(
+      processedKey,
+      outputBuffer,
+      "image/webp",
+      (phase) => onProgress({ phase })
+    );
     return { key: processedKey, contentType: "image/webp" };
+  }
+
+  private async readResponseBody(
+    res: Response,
+    totalBytes: number | undefined,
+    onProgress: (progress: ProcessingProgress) => void
+  ): Promise<Buffer> {
+    onProgress({ phase: "downloading", completedBytes: 0, totalBytes });
+    if (!res.body) {
+      const data = Buffer.from(await res.arrayBuffer());
+      onProgress({
+        phase: "downloading",
+        completedBytes: data.length,
+        totalBytes,
+      });
+      return data;
+    }
+
+    const chunks: Buffer[] = [];
+    const reader = res.body.getReader();
+    let completedBytes = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      chunks.push(chunk);
+      completedBytes += chunk.length;
+      onProgress({ phase: "downloading", completedBytes, totalBytes });
+    }
+    return Buffer.concat(chunks, completedBytes);
   }
 
   private async throttleOriginRequest(url: string): Promise<void> {

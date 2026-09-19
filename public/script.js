@@ -309,8 +309,68 @@ async function logSubmissionRecord({
   }
 }
 
-async function setImagePolling(img, cachedUrl) {
+function formatProgress(progress) {
+  const labels = {
+    queued: "Queued",
+    downloading: "Downloading origin",
+    transforming: "Transforming",
+    encrypting: "Encrypting",
+    uploading: "Uploading",
+    indexing: "Indexing",
+    transferring: "Downloading image",
+    decrypting: "Decrypting",
+    ready: "Ready",
+  };
+  const label = labels[progress.phase] || "Processing";
+  if (Number.isFinite(progress.percent)) {
+    return `${label}… ${progress.percent}%`;
+  }
+  if (Number.isFinite(progress.completedBytes)) {
+    return `${label}… ${(progress.completedBytes / 1024 / 1024).toFixed(1)} MB`;
+  }
+  return progress.phase === "ready" ? label : `${label}…`;
+}
+
+async function readResponseBuffer(response, onProgress) {
+  const totalHeader = Number(response.headers.get("content-length"));
+  const totalBytes =
+    Number.isFinite(totalHeader) && totalHeader >= 0 ? totalHeader : null;
+  if (!response.body) {
+    const data = new Uint8Array(await response.arrayBuffer());
+    onProgress({ phase: "transferring", completedBytes: data.length, totalBytes });
+    return data.buffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let completedBytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    completedBytes += value.length;
+    const percent = totalBytes
+      ? Math.min(100, Math.round((completedBytes / totalBytes) * 100))
+      : undefined;
+    onProgress({
+      phase: "transferring",
+      completedBytes,
+      totalBytes,
+      percent,
+    });
+  }
+  const joined = new Uint8Array(completedBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return joined.buffer;
+}
+
+async function setImagePolling(img, cachedUrl, onProgress) {
   const config = await encryptionConfig();
+  onProgress({ phase: "queued" });
   for (let retryCount = 0; retryCount <= MAX_POLL_RETRY; retryCount += 1) {
     let response;
     try {
@@ -333,19 +393,36 @@ async function setImagePolling(img, cachedUrl) {
           encryptedResponse = await fetch(descriptor.url, { cache: "no-store" });
           if (!encryptedResponse.ok) throw new Error("Encrypted image download failed");
         }
+        const encryptedPayload = await readResponseBuffer(
+          encryptedResponse,
+          onProgress
+        );
+        onProgress({ phase: "decrypting" });
         const plaintext = await decryptImagePayload(
-          await encryptedResponse.arrayBuffer()
+          encryptedPayload
         );
         blob = new Blob([plaintext], { type: contentType });
       } else {
-        blob = await response.blob();
+        const contentType = response.headers.get("content-type") || "";
+        const plaintext = await readResponseBuffer(response, onProgress);
+        blob = new Blob([plaintext], { type: contentType });
       }
       const objectUrl = URL.createObjectURL(blob);
       img.src = objectUrl;
+      onProgress({ phase: "ready", percent: 100 });
       return objectUrl;
     }
 
-    if (!response || response.status !== 503) {
+    if (response?.status === 503) {
+      try {
+        const progress = await response.json();
+        if (progress?.status === "processing") onProgress(progress);
+      } catch {
+        onProgress({ phase: "queued" });
+      }
+    } else if (!response) {
+      onProgress({ phase: "queued" });
+    } else {
       return null;
     }
 
@@ -426,7 +503,14 @@ function makeCard({ src, label, onClick, openImage = false }) {
 
   const img = document.createElement("img");
   img.loading = "lazy";
-  void setImagePolling(img, src).then((objectUrl) => {
+  const loadStatus = document.createElement("div");
+  loadStatus.className = "load-status";
+  loadStatus.textContent = "Queued…";
+  const onProgress = (progress) => {
+    loadStatus.textContent = formatProgress(progress);
+    loadStatus.hidden = progress.phase === "ready";
+  };
+  void setImagePolling(img, src, onProgress).then((objectUrl) => {
     if (
       openImage &&
       objectUrl &&
@@ -436,6 +520,8 @@ function makeCard({ src, label, onClick, openImage = false }) {
     }
   }).catch((error) => {
     img.alt = error instanceof Error ? error.message : "Image decryption failed";
+    loadStatus.textContent = "Failed";
+    loadStatus.classList.add("error");
   });
   img.alt = label;
 
@@ -444,6 +530,7 @@ function makeCard({ src, label, onClick, openImage = false }) {
   meta.textContent = label;
 
   mediaWrapper.appendChild(img);
+  mediaWrapper.appendChild(loadStatus);
   card.appendChild(mediaWrapper);
   card.appendChild(meta);
   return card;

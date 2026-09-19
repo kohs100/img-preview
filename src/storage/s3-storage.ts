@@ -78,7 +78,13 @@ export class S3Storage implements ObjectStorage {
     return Buffer.from(bytes);
   }
 
-  async write(key: string, data: Buffer, contentType?: string): Promise<void> {
+  async write(
+    key: string,
+    data: Buffer,
+    contentType?: string,
+    onPhase?: (phase: "encrypting" | "uploading") => void
+  ): Promise<void> {
+    onPhase?.("uploading");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {

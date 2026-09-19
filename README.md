@@ -25,14 +25,14 @@ PNG는 WebP로 변환한 뒤 캐시에 저장합니다. 캐시는 **로컬 파�
                               (fetch + 변환)      (fs  |  s3)
 ```
 
-## HTTP API (프론트엔드 계약 — 변경 없음)
+## HTTP API
 
 | 메서드 & 경로                        | 동작 |
 | ----------------------------------- | ---- |
 | `GET /`                             | `/static`로 302 리다이렉트 |
 | `GET /static/*`                     | 정적 프론트엔드 자산 |
-| `GET /cached/:imageUrl(*)?referrer=` | 캐시 적중 시 `200` + 이미지 바이트, 가져오는 중이면 `503 Processing`(첫 미스에서 fetch 시작), 실패 시 origin 에러 상태 |
-| `GET /refresh/:imageUrl(*)?referrer=` | 강제 재fetch 후 `503 Processing` 반환 |
+| `GET /cached/:imageUrl(*)?referrer=` | 캐시 적중 시 `200`; 처리 중이면 phase와 byte 진행도를 담은 `503` JSON, 실패 시 origin 에러 상태 |
+| `GET /refresh/:imageUrl(*)?referrer=` | 강제 재fetch 후 처리 상태 `503` JSON 반환 |
 | `POST /api/submissions`             | `204`; 프론트엔드 폼 제출을 로깅 |
 
 `:imageUrl`은 origin URL입니다. route가 `(*)` 와일드카드라 슬래시 포함 경로를 그대로
@@ -47,6 +47,23 @@ query/hash를 제거한 것이며, 스토리지 백엔드를 바꿔도 이 계�
 > 안전합니다. 다만 origin 경로에 `#`(브라우저가 fragment로 처리해 서버로 전송 안 됨),
 > 리터럴 `%`(잘못된 percent-encoding으로 해석될 수 있음), 공백/비-ASCII 등이 들어가면
 > 깨질 수 있으니 그런 경우엔 `encodeURIComponent`가 필요합니다.
+
+처리 중 응답 예시입니다. `Content-Length`를 제공하지 않는 origin이나 Sharp 변환,
+암호화·업로드·index 단계는 정확한 퍼센트 없이 phase만 반환합니다.
+
+```json
+{
+  "status": "processing",
+  "phase": "downloading",
+  "completedBytes": 524288,
+  "totalBytes": 2097152,
+  "percent": 25
+}
+```
+
+phase는 `queued`, `downloading`, `transforming`, `encrypting`, `uploading`, `indexing`
+순으로 진행됩니다. 브라우저 카드는 이후 S3 암호문 전송의 실제 byte 진행도와
+`decrypting` 상태도 별도로 표시합니다.
 
 ## 스토리지 아키텍처
 

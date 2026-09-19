@@ -19,7 +19,12 @@ export interface ObjectStorage {
    * `contentType` is persisted by backends that support it (S3) and ignored
    * by those that do not (filesystem keeps content type in the meta sidecar).
    */
-  write(key: string, data: Buffer, contentType?: string): Promise<void>;
+  write(
+    key: string,
+    data: Buffer,
+    contentType?: string,
+    onPhase?: (phase: "encrypting" | "uploading") => void
+  ): Promise<void>;
 
   /** Resolve true if the key exists. */
   exists(key: string): Promise<boolean>;
