@@ -20,6 +20,10 @@ export class EncryptedStorage implements ObjectStorage {
   private logicalKeys = new Set<string>();
   private manifestLoad?: Promise<void>;
   private deltaSequence = 0;
+  private readonly pendingAdded = new Set<string>();
+  private readonly pendingDeleted = new Set<string>();
+  private deltaTimer?: ReturnType<typeof setTimeout>;
+  private deltaFlush = Promise.resolve();
 
   constructor(
     private readonly inner: ObjectStorage,
@@ -124,7 +128,7 @@ export class EncryptedStorage implements ObjectStorage {
     onPhase?: (phase: "encrypting" | "uploading") => void
   ): Promise<void> {
     await this.writeDeferred(key, data, onPhase);
-    await this.appendManifestDelta([key], []);
+    this.queueManifestDelta([key], []);
   }
 
   /**
@@ -150,6 +154,7 @@ export class EncryptedStorage implements ObjectStorage {
 
   /** Add already-uploaded logical keys and persist one encrypted manifest. */
   async commitManifest(keys: Iterable<string> = []): Promise<void> {
+    await this.flushManifestDeltas();
     await this.appendManifestDelta([...keys], []);
   }
 
@@ -170,6 +175,7 @@ export class EncryptedStorage implements ObjectStorage {
   }
 
   async list(prefix = ""): Promise<string[]> {
+    await this.flushManifestDeltas();
     await this.ensureManifestLoaded();
     const keys = [...this.logicalKeys];
     return prefix ? keys.filter((key) => key.startsWith(prefix)) : keys;
@@ -179,11 +185,12 @@ export class EncryptedStorage implements ObjectStorage {
     await this.ready;
     await this.inner.delete(this.physicalKey(key));
     this.logicalKeys.delete(key);
-    await this.appendManifestDelta([], [key]);
+    this.queueManifestDelta([], [key]);
   }
 
   /** Merge the base snapshot and all deltas, then remove the applied deltas. */
   async compactManifest(): Promise<{ keys: number; deltas: number }> {
+    await this.flushManifestDeltas();
     await this.ensureManifestLoaded();
     const deltaKeys = await this.inner.list(MANIFEST_DELTA_PREFIX);
     await this.persistManifest();
@@ -207,6 +214,49 @@ export class EncryptedStorage implements ObjectStorage {
     return JSON.parse(
       (await this.inner.read(MASTER_KEY_OBJECT)).toString("utf8")
     ) as MasterKeyEnvelope;
+  }
+
+  /** Immediately persist all manifest changes currently waiting in the queue. */
+  async flushManifestDeltas(): Promise<void> {
+    if (this.deltaTimer) {
+      clearTimeout(this.deltaTimer);
+      this.deltaTimer = undefined;
+    }
+    await this.deltaFlush;
+    if (this.pendingAdded.size === 0 && this.pendingDeleted.size === 0) return;
+
+    const added = [...this.pendingAdded];
+    const deleted = [...this.pendingDeleted];
+    this.pendingAdded.clear();
+    this.pendingDeleted.clear();
+    const flush = this.appendManifestDelta(added, deleted);
+    this.deltaFlush = flush.catch((error: unknown) => {
+      this.queueManifestDelta(added, deleted);
+      // eslint-disable-next-line no-console
+      console.error(
+        `Manifest delta flush failed; queued for retry: ${
+          error instanceof Error ? error.message : error
+        }`
+      );
+    });
+    await flush;
+  }
+
+  private queueManifestDelta(added: string[], deleted: string[]): void {
+    for (const key of added) {
+      this.pendingDeleted.delete(key);
+      this.pendingAdded.add(key);
+    }
+    for (const key of deleted) {
+      this.pendingAdded.delete(key);
+      this.pendingDeleted.add(key);
+    }
+    if (!this.deltaTimer) {
+      this.deltaTimer = setTimeout(() => {
+        this.deltaTimer = undefined;
+        void this.flushManifestDeltas().catch(() => undefined);
+      }, 1000);
+    }
   }
 
   private async appendManifestDelta(

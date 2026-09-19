@@ -215,7 +215,10 @@ HTTPS(또는 localhost)에서만 사용할 수 있습니다.
 키 봉투가 감지되면 서버는 평문 fallback 없이 시작에 실패합니다.
 
 전체 logical key 목록은 암호화된 base manifest와 append-only delta로 관리합니다. 일반
-이미지 저장은 작은 delta만 추가하므로 base manifest를 읽거나 다시 업로드하지 않습니다.
+이미지 저장은 변경 key를 메모리에서 최대 1초간 모아 작은 delta 하나로 기록하므로 base
+manifest를 읽거나 다시 업로드하지 않습니다. 같은 key의 add/delete는 마지막 상태로
+합쳐집니다. 정상 종료(SIGINT/SIGTERM), `list()`, bulk commit, compaction에서는 대기 중인
+delta를 즉시 flush합니다.
 `list()`가 필요한 관리 작업에서만 base와 delta를 합칩니다. delta가 많이 쌓였을 때는
 서버를 정지한 뒤 다음 명령으로 새 base snapshot에 합칠 수 있습니다.
 

@@ -16,6 +16,8 @@ const backendConfig = backendConfigFromEnv();
 const storage = createStorage(backendConfig);
 const cacheManager = new CacheManager(storage);
 const downloadManager = new DownloadManager(storage, originMinIntervalMs);
+let httpServer: ReturnType<typeof app.listen> | undefined;
+let shuttingDown = false;
 
 app.get("/", (_req, res) => {
   res.redirect("/static");
@@ -215,7 +217,7 @@ async function startServer(): Promise<void> {
   // Unlike an ordinary index-listing failure, a bad encryption passphrase
   // must fail closed instead of starting a server that can never serve data.
   if (storage instanceof EncryptedStorage) await storage.ensureReady();
-  app.listen(port, () => {
+  httpServer = app.listen(port, () => {
     // eslint-disable-next-line no-console
     console.log(
       `Server running on http://localhost:${port} (cache backend: ${storage.backendName})`
@@ -228,3 +230,35 @@ void startServer().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : error);
   process.exitCode = 1;
 });
+
+async function shutdown(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const closeServer = new Promise<void>((resolve) => {
+    if (!httpServer) {
+      resolve();
+      return;
+    }
+    httpServer.close(() => resolve());
+  });
+  const forceExit = setTimeout(() => process.exit(1), 10_000);
+  forceExit.unref();
+  try {
+    if (storage instanceof EncryptedStorage) {
+      await storage.flushManifestDeltas();
+    }
+    await closeServer;
+    process.exit(0);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `Shutdown manifest flush failed: ${
+        error instanceof Error ? error.message : error
+      }`
+    );
+    process.exit(1);
+  }
+}
+
+process.once("SIGINT", () => void shutdown());
+process.once("SIGTERM", () => void shutdown());
