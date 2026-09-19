@@ -1,3 +1,4 @@
+import "dotenv/config";
 import path from "path";
 import { FsStorage } from "./fs-storage";
 import { S3Storage } from "./s3-storage";

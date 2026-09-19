@@ -10,11 +10,13 @@
     "start": "node dist/server.js",
     "migrate": "tsx src/migrate.ts",
     "encrypt-cache": "tsx src/encrypt-cache.ts",
+    "migrate-index": "tsx src/migrate-index.ts",
     "change-passphrase": "tsx src/change-passphrase.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1075.0",
     "@aws-sdk/s3-request-presigner": "^3.1075.0",
+    "dotenv": "^16.6.1",
     "express": "^4.19.2",
     "sharp": "^0.33.5"
   },

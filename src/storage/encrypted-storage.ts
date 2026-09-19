@@ -18,6 +18,7 @@ export class EncryptedStorage implements ObjectStorage {
   private masterKey!: Buffer;
   private logicalKeys = new Set<string>();
   private manifestWrite = Promise.resolve();
+  private manifestLoad?: Promise<void>;
 
   constructor(
     private readonly inner: ObjectStorage,
@@ -46,7 +47,15 @@ export class EncryptedStorage implements ObjectStorage {
         "application/json"
       );
     }
+  }
 
+  private async ensureManifestLoaded(): Promise<void> {
+    await this.ready;
+    if (!this.manifestLoad) this.manifestLoad = this.loadManifest();
+    await this.manifestLoad;
+  }
+
+  private async loadManifest(): Promise<void> {
     if (await this.inner.exists(MANIFEST_OBJECT)) {
       const raw = decryptObject(
         await this.inner.read(MANIFEST_OBJECT),
@@ -83,7 +92,7 @@ export class EncryptedStorage implements ObjectStorage {
   }
 
   async write(key: string, data: Buffer): Promise<void> {
-    await this.ready;
+    await this.ensureManifestLoaded();
     const wasNew = !this.logicalKeys.has(key);
     await this.writeDeferred(key, data);
     if (wasNew) {
@@ -115,7 +124,7 @@ export class EncryptedStorage implements ObjectStorage {
 
   /** Add already-uploaded logical keys and persist one encrypted manifest. */
   async commitManifest(keys: Iterable<string> = []): Promise<void> {
-    await this.ready;
+    await this.ensureManifestLoaded();
     for (const key of keys) this.logicalKeys.add(key);
     this.manifestWrite = this.manifestWrite
       .catch(() => undefined)
@@ -140,13 +149,13 @@ export class EncryptedStorage implements ObjectStorage {
   }
 
   async list(prefix = ""): Promise<string[]> {
-    await this.ready;
+    await this.ensureManifestLoaded();
     const keys = [...this.logicalKeys];
     return prefix ? keys.filter((key) => key.startsWith(prefix)) : keys;
   }
 
   async delete(key: string): Promise<void> {
-    await this.ready;
+    await this.ensureManifestLoaded();
     await this.inner.delete(this.physicalKey(key));
     if (this.logicalKeys.delete(key)) {
       this.manifestWrite = this.manifestWrite

@@ -107,7 +107,8 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
   }
 
   const { cacheKey, fetchUrl, referrer } = params;
-  const entry = cacheManager.get(cacheKey);
+  const entry =
+    (await cacheManager.get(cacheKey)) ?? cacheManager.getCached(cacheKey);
 
   if (entry?.status === "ready" && entry.key && entry.contentType) {
     // Offload the byte transfer to the storage backend when it can hand out a
@@ -172,7 +173,9 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
   }
 
   // Start processing and return 503 until done
-  startDownload(cacheKey, fetchUrl, referrer);
+  if (cacheManager.claimProcessing(cacheKey)) {
+    startDownload(cacheKey, fetchUrl, referrer);
+  }
   res.status(503).send("Processing");
 });
 
@@ -192,7 +195,6 @@ async function startServer(): Promise<void> {
   // Unlike an ordinary index-listing failure, a bad encryption passphrase
   // must fail closed instead of starting a server that can never serve data.
   if (storage instanceof EncryptedStorage) await storage.ensureReady();
-  await cacheManager.rebuildFromStorage();
   app.listen(port, () => {
     // eslint-disable-next-line no-console
     console.log(

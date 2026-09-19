@@ -57,9 +57,10 @@ query/hash를 제거한 것이며, 스토리지 백엔드를 바꿔도 이 계�
 
 - `source/<host>/<path>` — 다운로드한 원본 바이트.
 - `processed/<host>/<path>` — 서빙되는 오브젝트(PNG 입력은 WebP, 그 외에는 원본과 동일).
-- `<key>.meta.json` — `{ url, key, contentType, updatedAt }`을 담는 사이드카.
-  서버는 시작 시 이 사이드카들을 나열해 메모리 인덱스를 복원하므로 재시작 후에도
-  캐시가 유지됩니다.
+- `index/<sha256(url)>.json` — `{ url, key, contentType, updatedAt }`을 담는 index.
+  요청 URL에서 key를 결정할 수 있어 서버 시작 시 전체 목록을 읽지 않습니다. 첫 요청에서
+  해당 index 하나만 읽고 이후에는 메모리에 유지합니다. 암호화 backend에서는 이 논리
+  key도 다시 HMAC opaque key로 변환됩니다.
 
 `ObjectStorage` 인터페이스(`src/storage/types.ts`)에는 두 가지 구현이 있습니다.
 
@@ -133,6 +134,9 @@ npm start
 
 `http://localhost:3013/` 접속.
 
+프로젝트 루트의 `.env`는 `dotenv`로 자동 로드되며, 이미 설정된 프로세스 환경 변수가
+같은 이름의 `.env` 값보다 우선합니다.
+
 ## 비신뢰 저장소 암호화
 
 `CACHE_ENCRYPTION=true`는 랜덤 256-bit 마스터키로 모든 이미지와 메타데이터를
@@ -173,6 +177,14 @@ CACHE_ENCRYPTION_NEW_PASSPHRASE='new long passphrase' \
 npm run change-passphrase
 ```
 
+이전 버전의 `<object-key>.meta.json` sidecar가 있는 저장소는 서버 전환 전에 URL 기반
+온디맨드 index로 변환합니다. 기존 sidecar는 롤백을 위해 삭제하지 않습니다. 명령은
+재실행 가능하며 이미 존재하는 index는 건너뜁니다.
+
+```bash
+npm run migrate-index
+```
+
 키 봉투와 암호화 manifest의 고정 bootstrap 객체명, 객체 개수·크기·접근 시각은 저장소에
 노출됩니다. 실제 데이터 경로와 manifest 내용은 노출되지 않습니다. 브라우저 Web Crypto는
 HTTPS(또는 localhost)에서만 사용할 수 있습니다.
@@ -207,16 +219,15 @@ npm run migrate -- s3 fs
 | `--encrypt-destination` | 목적지에 AES-GCM 암호문과 HMAC 기반 opaque key로 기록 |
 
 마이그레이션은 멱등적입니다 — 재실행하면 `--overwrite`가 없는 한 대상에 이미 존재하는
-오브젝트를 건너뜁니다. key가 백엔드 간 동일하므로, 마이그레이션된 캐시는 별도의
-재인덱싱 없이 그대로 서빙됩니다 — 서버가 다음 시작 시 복사된 `.meta.json` 사이드카로
-인덱스를 복원합니다.
+오브젝트를 건너뜁니다. 구 버전의 `.meta.json`을 옮긴 경우 `npm run migrate-index`를 한 번
+실행해야 새 서버가 URL 기반 index를 온디맨드로 조회할 수 있습니다.
 
 ## 프로젝트 구조
 
 ```
 src/
   server.ts            Express 앱 + 라우트 (프론트엔드 계약)
-  cache-manager.ts     메모리 인덱스 + .meta.json 영속화/복원
+  cache-manager.ts     URL 기반 온디맨드 index + 메모리 hot cache
   download-manager.ts  origin fetch, 호스트별 throttle, PNG→WebP 변환
   migrate.ts           fs <-> s3 마이그레이션 CLI
   storage/

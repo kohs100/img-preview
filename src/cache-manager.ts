@@ -1,8 +1,8 @@
+import { createHash } from "crypto";
 import type { ObjectStorage } from "./storage";
 
 export type CacheEntry = {
   status: "processing" | "ready" | "error";
-  /** Storage key of the servable object (backend-agnostic). */
   key?: string;
   contentType?: string;
   errorStatusCode?: number;
@@ -10,48 +10,68 @@ export type CacheEntry = {
   updatedAt: number;
 };
 
-type PersistedCacheMeta = {
+export type PersistedCacheMeta = {
   url: string;
-  /** New field. Older meta files use `filePathRelative` instead. */
   key?: string;
   filePathRelative?: string;
   contentType: string;
   updatedAt: number;
 };
 
-const cacheMetaSuffix = ".meta.json";
+/** Deterministic lookup key; EncryptedStorage maps it to a secret HMAC path. */
+export function cacheIndexKey(url: string): string {
+  const digest = createHash("sha256").update(url).digest("base64url");
+  return `index/${digest}.json`;
+}
 
-/**
- * Tracks the state of each cached image keyed by its origin URL. The actual
- * bytes live in an {@link ObjectStorage} backend; this manager only holds the
- * lightweight in-memory index plus the persisted `.meta.json` sidecars that
- * let the index be rebuilt on startup.
- */
+/** In-memory hot cache backed by one deterministic storage object per URL. */
 export class CacheManager {
-  private readonly storage: ObjectStorage;
-
   private readonly cache = new Map<string, CacheEntry>();
 
-  constructor(storage: ObjectStorage) {
-    this.storage = storage;
+  private readonly pendingLoads = new Map<
+    string,
+    Promise<CacheEntry | undefined>
+  >();
+
+  constructor(private readonly storage: ObjectStorage) {}
+
+  getCached(url: string): CacheEntry | undefined {
+    return this.cache.get(url);
   }
 
-  get(url: string): CacheEntry | undefined {
-    return this.cache.get(url);
+  async get(url: string): Promise<CacheEntry | undefined> {
+    const cached = this.cache.get(url);
+    if (cached) return cached;
+
+    const pending = this.pendingLoads.get(url);
+    if (pending) return pending;
+
+    const load = this.loadPersisted(url).finally(() => {
+      this.pendingLoads.delete(url);
+    });
+    this.pendingLoads.set(url, load);
+    return load;
   }
 
   setProcessing(url: string): void {
     this.cache.set(url, { status: "processing", updatedAt: Date.now() });
   }
 
+  claimProcessing(url: string): boolean {
+    if (this.cache.has(url)) return false;
+    this.setProcessing(url);
+    return true;
+  }
+
   async setReady(url: string, key: string, contentType: string): Promise<void> {
-    await this.persistCacheMeta(url, key, contentType);
-    this.cache.set(url, {
-      status: "ready",
-      key,
-      contentType,
-      updatedAt: Date.now(),
-    });
+    const updatedAt = Date.now();
+    const metadata: PersistedCacheMeta = { url, key, contentType, updatedAt };
+    await this.storage.write(
+      cacheIndexKey(url),
+      Buffer.from(`${JSON.stringify(metadata)}\n`),
+      "application/json"
+    );
+    this.cache.set(url, { status: "ready", key, contentType, updatedAt });
   }
 
   setError(url: string, errorStatusCode: number, errorMessage: string): void {
@@ -63,88 +83,38 @@ export class CacheManager {
     });
   }
 
-  /** Rebuild the in-memory index from the `.meta.json` sidecars in storage. */
-  async rebuildFromStorage(): Promise<void> {
-    let allKeys: string[];
+  private async loadPersisted(url: string): Promise<CacheEntry | undefined> {
     try {
-      allKeys = await this.storage.list();
-    } catch (error) {
-      // A listing failure (transient backend error, missing permission) must
-      // not stop startup — the cache repopulates on demand. Log and continue.
-      // eslint-disable-next-line no-console
-      console.warn(
-        `Cache index rebuild skipped: ${
-          error instanceof Error ? error.message : error
-        }`
-      );
-      return;
+      const raw = JSON.parse(
+        (await this.storage.read(cacheIndexKey(url))).toString("utf8")
+      ) as unknown;
+      if (!this.isPersistedMeta(raw) || raw.url !== url) return undefined;
+      const key = raw.key ?? raw.filePathRelative;
+      if (!key) return undefined;
+      const entry: CacheEntry = {
+        status: "ready",
+        key,
+        contentType: raw.contentType,
+        updatedAt: raw.updatedAt,
+      };
+      this.cache.set(url, entry);
+      return entry;
+    } catch {
+      // Missing index objects are normal cache misses. Corrupt/authentication
+      // failures also fail closed and are healed by fetching the origin again.
+      return undefined;
     }
-    const metaKeys = allKeys.filter((key) => key.endsWith(cacheMetaSuffix));
-    const allKeySet = new Set(allKeys);
-    let nextMetaIndex = 0;
-    const workerCount = Math.min(32, metaKeys.length);
-    await Promise.all(
-      Array.from({ length: workerCount }, async () => {
-        for (;;) {
-          const index = nextMetaIndex;
-          nextMetaIndex += 1;
-          if (index >= metaKeys.length) return;
-          try {
-            const raw = JSON.parse(
-              (await this.storage.read(metaKeys[index])).toString("utf-8")
-            ) as unknown;
-            if (!this.isPersistedMeta(raw)) continue;
-            const objectKey = raw.key ?? raw.filePathRelative;
-            // list() already returned a consistent object snapshot. Avoid one
-            // remote HEAD per sidecar, which is prohibitively slow on S3.
-            if (!objectKey || !allKeySet.has(objectKey)) continue;
-            this.cache.set(raw.url, {
-              status: "ready",
-              key: objectKey,
-              contentType: raw.contentType,
-              updatedAt: raw.updatedAt,
-            });
-          } catch {
-            // Ignore malformed metadata entries and continue startup.
-          }
-        }
-      }
-    ));
-  }
-
-  private getCacheMetaKey(key: string): string {
-    return `${key}${cacheMetaSuffix}`;
-  }
-
-  private async persistCacheMeta(
-    url: string,
-    key: string,
-    contentType: string
-  ): Promise<void> {
-    const metadata: PersistedCacheMeta = {
-      url,
-      key,
-      contentType,
-      updatedAt: Date.now(),
-    };
-    await this.storage.write(
-      this.getCacheMetaKey(key),
-      Buffer.from(`${JSON.stringify(metadata)}\n`),
-      "application/json"
-    );
   }
 
   private isPersistedMeta(raw: unknown): raw is PersistedCacheMeta {
     if (!raw || typeof raw !== "object") return false;
-    const candidate = raw as Record<string, unknown>;
-    const hasObjectKey =
-      typeof candidate.key === "string" ||
-      typeof candidate.filePathRelative === "string";
+    const value = raw as Record<string, unknown>;
     return (
-      typeof candidate.url === "string" &&
-      hasObjectKey &&
-      typeof candidate.contentType === "string" &&
-      typeof candidate.updatedAt === "number"
+      typeof value.url === "string" &&
+      (typeof value.key === "string" ||
+        typeof value.filePathRelative === "string") &&
+      typeof value.contentType === "string" &&
+      typeof value.updatedAt === "number"
     );
   }
 }
