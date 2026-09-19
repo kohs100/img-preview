@@ -11,6 +11,7 @@
     "migrate": "tsx src/migrate.ts",
     "encrypt-cache": "tsx src/encrypt-cache.ts",
     "migrate-index": "tsx src/migrate-index.ts",
+    "compact-manifest": "tsx src/compact-manifest.ts",
     "change-passphrase": "tsx src/change-passphrase.ts"
   },
   "dependencies": {

@@ -1,9 +1,10 @@
-import { randomBytes } from "crypto";
+import { randomBytes, randomUUID } from "crypto";
 import type { ObjectStorage } from "./types";
 import {
   decryptObject,
   encryptObject,
   MANIFEST_OBJECT,
+  MANIFEST_DELTA_PREFIX,
   MASTER_KEY_OBJECT,
   type MasterKeyEnvelope,
   opaqueObjectKey,
@@ -17,8 +18,8 @@ export class EncryptedStorage implements ObjectStorage {
   private readonly ready: Promise<void>;
   private masterKey!: Buffer;
   private logicalKeys = new Set<string>();
-  private manifestWrite = Promise.resolve();
   private manifestLoad?: Promise<void>;
+  private deltaSequence = 0;
 
   constructor(
     private readonly inner: ObjectStorage,
@@ -67,6 +68,31 @@ export class EncryptedStorage implements ObjectStorage {
       }
       this.logicalKeys = new Set(keys);
     }
+    const deltaKeys = (await this.inner.list(MANIFEST_DELTA_PREFIX)).sort();
+    const deltas = new Map<string, ManifestDelta>();
+    let nextDelta = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(32, deltaKeys.length) }, async () => {
+        for (;;) {
+          const index = nextDelta;
+          nextDelta += 1;
+          if (index >= deltaKeys.length) return;
+          const key = deltaKeys[index];
+          const raw = decryptObject(await this.inner.read(key), this.masterKey);
+          const delta = JSON.parse(raw.toString("utf8")) as unknown;
+          if (!this.isManifestDelta(delta)) {
+            throw new Error(`Encrypted storage manifest delta is invalid: ${key}`);
+          }
+          deltas.set(key, delta);
+        }
+      })
+    );
+    for (const key of deltaKeys) {
+      const delta = deltas.get(key);
+      if (!delta) continue;
+      for (const added of delta.added) this.logicalKeys.add(added);
+      for (const deleted of delta.deleted) this.logicalKeys.delete(deleted);
+    }
   }
 
   async ensureReady(): Promise<void> {
@@ -97,20 +123,8 @@ export class EncryptedStorage implements ObjectStorage {
     _contentType?: string,
     onPhase?: (phase: "encrypting" | "uploading") => void
   ): Promise<void> {
-    await this.ensureManifestLoaded();
-    const wasNew = !this.logicalKeys.has(key);
     await this.writeDeferred(key, data, onPhase);
-    if (wasNew) {
-      this.manifestWrite = this.manifestWrite
-        .catch(() => undefined)
-        .then(() => this.persistManifest());
-      try {
-        await this.manifestWrite;
-      } catch (error) {
-        if (wasNew) this.logicalKeys.delete(key);
-        throw error;
-      }
-    }
+    await this.appendManifestDelta([key], []);
   }
 
   /**
@@ -136,12 +150,7 @@ export class EncryptedStorage implements ObjectStorage {
 
   /** Add already-uploaded logical keys and persist one encrypted manifest. */
   async commitManifest(keys: Iterable<string> = []): Promise<void> {
-    await this.ensureManifestLoaded();
-    for (const key of keys) this.logicalKeys.add(key);
-    this.manifestWrite = this.manifestWrite
-      .catch(() => undefined)
-      .then(() => this.persistManifest());
-    await this.manifestWrite;
+    await this.appendManifestDelta([...keys], []);
   }
 
   /** Bulk-resolve which logical keys already have opaque objects in storage. */
@@ -167,14 +176,19 @@ export class EncryptedStorage implements ObjectStorage {
   }
 
   async delete(key: string): Promise<void> {
-    await this.ensureManifestLoaded();
+    await this.ready;
     await this.inner.delete(this.physicalKey(key));
-    if (this.logicalKeys.delete(key)) {
-      this.manifestWrite = this.manifestWrite
-        .catch(() => undefined)
-        .then(() => this.persistManifest());
-      await this.manifestWrite;
-    }
+    this.logicalKeys.delete(key);
+    await this.appendManifestDelta([], [key]);
+  }
+
+  /** Merge the base snapshot and all deltas, then remove the applied deltas. */
+  async compactManifest(): Promise<{ keys: number; deltas: number }> {
+    await this.ensureManifestLoaded();
+    const deltaKeys = await this.inner.list(MANIFEST_DELTA_PREFIX);
+    await this.persistManifest();
+    await Promise.all(deltaKeys.map((key) => this.inner.delete(key)));
+    return { keys: this.logicalKeys.size, deltas: deltaKeys.length };
   }
 
   async getRedirectUrl(key: string): Promise<string | null> {
@@ -194,4 +208,42 @@ export class EncryptedStorage implements ObjectStorage {
       (await this.inner.read(MASTER_KEY_OBJECT)).toString("utf8")
     ) as MasterKeyEnvelope;
   }
+
+  private async appendManifestDelta(
+    added: string[],
+    deleted: string[]
+  ): Promise<void> {
+    await this.ready;
+    if (added.length === 0 && deleted.length === 0) return;
+    for (const key of added) this.logicalKeys.add(key);
+    for (const key of deleted) this.logicalKeys.delete(key);
+    this.deltaSequence = (this.deltaSequence + 1) % 1_000_000;
+    const timestamp = String(Date.now()).padStart(13, "0");
+    const sequence = String(this.deltaSequence).padStart(6, "0");
+    const deltaKey = `${MANIFEST_DELTA_PREFIX}${timestamp}-${sequence}-${randomUUID()}`;
+    const delta: ManifestDelta = { version: 1, added, deleted };
+    await this.inner.write(
+      deltaKey,
+      encryptObject(Buffer.from(JSON.stringify(delta)), this.masterKey),
+      "application/octet-stream"
+    );
+  }
+
+  private isManifestDelta(value: unknown): value is ManifestDelta {
+    if (!value || typeof value !== "object") return false;
+    const delta = value as Record<string, unknown>;
+    return (
+      delta.version === 1 &&
+      Array.isArray(delta.added) &&
+      delta.added.every((key) => typeof key === "string") &&
+      Array.isArray(delta.deleted) &&
+      delta.deleted.every((key) => typeof key === "string")
+    );
+  }
 }
+
+type ManifestDelta = {
+  version: 1;
+  added: string[];
+  deleted: string[];
+};

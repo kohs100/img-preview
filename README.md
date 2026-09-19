@@ -214,6 +214,15 @@ HTTPS(또는 localhost)에서만 사용할 수 있습니다.
 최초 키 봉투 생성은 단일 서버 인스턴스로 수행해야 합니다. 잘못된 passphrase나 손상된
 키 봉투가 감지되면 서버는 평문 fallback 없이 시작에 실패합니다.
 
+전체 logical key 목록은 암호화된 base manifest와 append-only delta로 관리합니다. 일반
+이미지 저장은 작은 delta만 추가하므로 base manifest를 읽거나 다시 업로드하지 않습니다.
+`list()`가 필요한 관리 작업에서만 base와 delta를 합칩니다. delta가 많이 쌓였을 때는
+서버를 정지한 뒤 다음 명령으로 새 base snapshot에 합칠 수 있습니다.
+
+```bash
+npm run compact-manifest
+```
+
 ## 백엔드 간 마이그레이션
 
 `npm run migrate -- <from> <to>`는 모든 오브젝트(이미지 + meta 사이드카)를 한 백엔드에서

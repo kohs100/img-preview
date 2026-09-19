@@ -10,6 +10,7 @@ import {
 export const ENCRYPTED_OBJECT_MAGIC = Buffer.from("IPV1");
 export const MASTER_KEY_OBJECT = ".img-preview-key-v1.json";
 export const MANIFEST_OBJECT = ".img-preview-manifest-v1";
+export const MANIFEST_DELTA_PREFIX = ".img-preview-manifest-delta-v1/";
 export const DEFAULT_PBKDF2_ITERATIONS = 600_000;
 const HKDF_SALT = Buffer.from("img-preview-v1");
 
