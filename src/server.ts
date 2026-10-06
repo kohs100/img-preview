@@ -1,4 +1,5 @@
 import express from "express";
+import net from "net";
 import { CacheManager } from "./cache-manager";
 import { DownloadManager, UpstreamHttpError } from "./download-manager";
 import { backendConfigFromEnv, createStorage, EncryptedStorage } from "./storage";
@@ -12,10 +13,29 @@ const originMinIntervalMs = process.env.ORIGIN_MIN_INTERVAL_MS
 const errorRetryMs = process.env.ERROR_RETRY_MS
   ? Number(process.env.ERROR_RETRY_MS)
   : 5 * 60 * 1000;
+const originMaxConcurrency = process.env.ORIGIN_MAX_CONCURRENCY
+  ? Number(process.env.ORIGIN_MAX_CONCURRENCY)
+  : 8;
+const originRetries = process.env.ORIGIN_RETRIES
+  ? Number(process.env.ORIGIN_RETRIES)
+  : 2;
+// Node tries each resolved address for only 250ms by default ("happy
+// eyeballs"); under a burst of new connections that gives up before a single
+// SYN retransmit and surfaces as AggregateError [ETIMEDOUT].
+net.setDefaultAutoSelectFamilyAttemptTimeout(
+  process.env.ORIGIN_CONNECT_ATTEMPT_TIMEOUT_MS
+    ? Number(process.env.ORIGIN_CONNECT_ATTEMPT_TIMEOUT_MS)
+    : 2000
+);
 const backendConfig = backendConfigFromEnv();
 const storage = createStorage(backendConfig);
 const cacheManager = new CacheManager(storage);
-const downloadManager = new DownloadManager(storage, originMinIntervalMs);
+const downloadManager = new DownloadManager(
+  storage,
+  originMinIntervalMs,
+  originMaxConcurrency,
+  originRetries
+);
 
 app.get("/", (_req, res) => {
   res.redirect("/static");

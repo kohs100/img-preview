@@ -24,6 +24,32 @@ export class UpstreamHttpError extends Error {
   }
 }
 
+/** Connection-level failures worth retrying; HTTP error statuses are not. */
+const TRANSIENT_NETWORK_CODES = new Set([
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+
+/** First error code found along the `cause` chain (undici wraps socket errors). */
+function networkErrorCode(error: unknown): string | undefined {
+  let current: unknown = error;
+  for (let depth = 0; current && typeof current === "object" && depth < 5; depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
 /**
  * Fetches images from origin (rate-limited per host), optionally transcodes
  * PNG to WebP, and writes the result through an {@link ObjectStorage} backend.
@@ -38,7 +64,16 @@ export class DownloadManager {
 
   private readonly originNextAllowedAt = new Map<string, number>();
 
-  constructor(storage: ObjectStorage, originMinIntervalMs: number) {
+  private readonly originActive = new Map<string, number>();
+
+  private readonly originWaiters = new Map<string, Array<() => void>>();
+
+  constructor(
+    storage: ObjectStorage,
+    originMinIntervalMs: number,
+    private readonly originMaxConcurrency = 8,
+    private readonly originRetries = 2
+  ) {
     this.storage = storage;
     this.originMinIntervalMs = originMinIntervalMs;
   }
@@ -49,17 +84,11 @@ export class DownloadManager {
     onProgress: (progress: ProcessingProgress) => void = () => undefined
   ): Promise<{ key: string; contentType: string }> {
     onProgress({ phase: "queued" });
-    await this.throttleOriginRequest(url);
-    const res = await fetch(url, { referrer });
-    if (!res.ok) {
-      throw new UpstreamHttpError(res.status, `Upstream fetch failed: ${res.status}`);
-    }
-
-    const totalHeader = Number(res.headers.get("content-length"));
-    const totalBytes =
-      Number.isFinite(totalHeader) && totalHeader >= 0 ? totalHeader : undefined;
-    const inputBuffer = await this.readResponseBody(res, totalBytes, onProgress);
-    const headerType = res.headers.get("content-type") || "";
+    const { inputBuffer, headerType } = await this.fetchFromOrigin(
+      url,
+      referrer,
+      onProgress
+    );
     const sourceExt = this.extensionFromUrl(url) || this.extensionFromContentType(headerType);
     const isPng = headerType.includes("image/png") || url.toLowerCase().endsWith(".png");
     const processedExt = isPng ? ".webp" : sourceExt || ".bin";
@@ -86,6 +115,77 @@ export class DownloadManager {
       (phase) => onProgress({ phase })
     );
     return { key: processedKey, contentType: "image/webp" };
+  }
+
+  /**
+   * Downloads the body while holding one of the host's connection slots, so
+   * a burst of cache misses cannot open unbounded connections to one origin.
+   * Connection-level failures are retried with backoff outside the slot.
+   */
+  private async fetchFromOrigin(
+    url: string,
+    referrer: string,
+    onProgress: (progress: ProcessingProgress) => void
+  ): Promise<{ inputBuffer: Buffer; headerType: string }> {
+    const host = new URL(url).host;
+    for (let attempt = 1; ; attempt += 1) {
+      const release = await this.acquireOriginSlot(host);
+      try {
+        await this.throttleOriginRequest(url);
+        const res = await fetch(url, { referrer });
+        if (!res.ok) {
+          throw new UpstreamHttpError(res.status, `Upstream fetch failed: ${res.status}`);
+        }
+        const totalHeader = Number(res.headers.get("content-length"));
+        const totalBytes =
+          Number.isFinite(totalHeader) && totalHeader >= 0 ? totalHeader : undefined;
+        const inputBuffer = await this.readResponseBody(res, totalBytes, onProgress);
+        return { inputBuffer, headerType: res.headers.get("content-type") || "" };
+      } catch (error) {
+        const code = networkErrorCode(error);
+        if (attempt > this.originRetries || !code || !TRANSIENT_NETWORK_CODES.has(code)) {
+          throw error;
+        }
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[${new Date().toISOString()}] origin-retry ${attempt}/${this.originRetries} ${code} ${url}`
+        );
+      } finally {
+        release();
+      }
+      onProgress({ phase: "queued" });
+      await this.sleep(1000 * 2 ** (attempt - 1));
+    }
+  }
+
+  private async acquireOriginSlot(host: string): Promise<() => void> {
+    if (!(this.originMaxConcurrency > 0)) return () => undefined;
+    const active = this.originActive.get(host) ?? 0;
+    if (active < this.originMaxConcurrency) {
+      this.originActive.set(host, active + 1);
+    } else {
+      // The releasing download hands its slot over, so `active` is unchanged.
+      await new Promise<void>((resolve) => {
+        const waiters = this.originWaiters.get(host) ?? [];
+        waiters.push(resolve);
+        this.originWaiters.set(host, waiters);
+      });
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const waiters = this.originWaiters.get(host);
+      const next = waiters?.shift();
+      if (waiters && waiters.length === 0) this.originWaiters.delete(host);
+      if (next) {
+        next();
+        return;
+      }
+      const remaining = (this.originActive.get(host) ?? 1) - 1;
+      if (remaining > 0) this.originActive.set(host, remaining);
+      else this.originActive.delete(host);
+    };
   }
 
   private async readResponseBody(

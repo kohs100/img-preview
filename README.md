@@ -115,6 +115,9 @@ CORS 없이 동작합니다.
 | ------------------------- | ----------- | ---- |
 | `PORT`                    | `3013`      | HTTP 포트 |
 | `ORIGIN_MIN_INTERVAL_MS`  | `200`       | 동일 origin 호스트로의 요청 간 최소 간격 |
+| `ORIGIN_MAX_CONCURRENCY`  | `8`         | 동일 origin 호스트로 동시에 진행하는 다운로드 수. `0`이면 무제한 |
+| `ORIGIN_RETRIES`          | `2`         | 연결 단계 오류(ETIMEDOUT, ECONNRESET 등) 재시도 횟수. 1s, 2s backoff. HTTP 에러 status는 재시도하지 않음 |
+| `ORIGIN_CONNECT_ATTEMPT_TIMEOUT_MS` | `2000` | 호스트가 여러 주소로 resolve될 때 주소 하나당 연결 시도 시간(Node 기본 250ms) |
 | `ERROR_RETRY_MS`          | `300000`    | 캐시된 origin 에러를 재시도 없이 그대로 반환하는 기간(ms). 이보다 오래된 에러는 다음 요청에서 origin 재시도. `0`이면 비활성화(에러 영구 캐시) |
 | `CACHE_BACKEND`           | `fs`        | `fs` 또는 `s3` |
 | `CACHE_DIR`               | `cache`     | `fs` 백엔드의 베이스 디렉터리 |
