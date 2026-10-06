@@ -65,6 +65,23 @@ function toCacheKey(url: string): string {
   return parsed.toString();
 }
 
+/** Stack plus the `cause` chain, e.g. undici's "fetch failed" -> ECONNREFUSED. */
+function describeError(error: unknown): string {
+  const lines: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; current !== undefined && depth < 5; depth += 1) {
+    const prefix = depth === 0 ? "" : "Caused by: ";
+    if (current instanceof Error) {
+      lines.push(prefix + (current.stack ?? `${current.name}: ${current.message}`));
+      current = (current as { cause?: unknown }).cause;
+    } else {
+      lines.push(prefix + String(current));
+      break;
+    }
+  }
+  return lines.join("\n");
+}
+
 function startDownload(cacheKey: string, fetchUrl: string, referrer: string): void {
   cacheManager.setProcessing(cacheKey);
   downloadManager
@@ -80,6 +97,13 @@ function startDownload(cacheKey: string, fetchUrl: string, referrer: string): vo
         error instanceof UpstreamHttpError ? error.statusCode : 502;
       const errorMessage =
         error instanceof Error ? error.message : "Upstream fetch failed";
+      if (errorStatusCode === 502) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[${new Date().toISOString()}] cache-fill-failed 502 ${fetchUrl} ` +
+            `referrer=${referrer}\n${describeError(error)}`
+        );
+      }
       cacheManager.setError(cacheKey, errorStatusCode, errorMessage);
     });
 }
