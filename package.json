@@ -9,9 +9,6 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "migrate": "tsx src/migrate.ts",
-    "encrypt-cache": "tsx src/encrypt-cache.ts",
-    "migrate-index": "tsx src/migrate-index.ts",
-    "migrate-paths": "tsx src/migrate-paths.ts",
     "change-passphrase": "tsx src/change-passphrase.ts"
   },
   "dependencies": {

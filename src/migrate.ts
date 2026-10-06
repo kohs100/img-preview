@@ -79,7 +79,7 @@ async function migrateKey(
     return "copied";
   }
   const data = await source.read(key);
-  const contentType = key.endsWith(".meta.json")
+  const contentType = key.endsWith(".json")
     ? "application/json"
     : undefined;
   let lastError: unknown;

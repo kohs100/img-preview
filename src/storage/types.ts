@@ -17,7 +17,7 @@ export interface ObjectStorage {
   /**
    * Write an object, creating any intermediate structure as needed.
    * `contentType` is persisted by backends that support it (S3) and ignored
-   * by those that do not (filesystem keeps content type in the meta sidecar).
+   * by those that do not (the cache index keeps the content type).
    */
   write(
     key: string,
@@ -34,12 +34,6 @@ export interface ObjectStorage {
 
   /** Delete an object. Resolves even if the key is already absent. */
   delete(key: string): Promise<void>;
-
-  /**
-   * Optional. Copy an object's bytes inside the same backend without
-   * downloading them (S3 CopyObject). Callers fall back to read + write.
-   */
-  copy?(fromKey: string, toKey: string): Promise<void>;
 
   /**
    * Optional. Return a browser-reachable URL the client can be redirected to

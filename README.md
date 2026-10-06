@@ -183,17 +183,6 @@ CACHE_ENCRYPTION_PASSPHRASE='a long private passphrase' \
 S3_BUCKET=img-cache npm start
 ```
 
-기존 평문 캐시는 서버를 정지한 상태에서 같은 백엔드 안에서 변환합니다. 각 객체는
-암호화본 쓰기가 성공한 뒤 평문이 삭제되므로 중단 후 재실행할 수 있습니다.
-첫 실행 전 버킷 버전 관리나 별도 백업을 권장합니다. `--keep-plaintext`를 붙이면 평문을
-삭제하지 않습니다.
-
-```bash
-CACHE_BACKEND=s3 \
-CACHE_ENCRYPTION_PASSPHRASE='a long private passphrase' \
-S3_BUCKET=img-cache npm run encrypt-cache
-```
-
 passphrase 변경은 이미지 재암호화 없이 마스터키 봉투만 다시 암호화합니다. 실행 중인
 서버를 정지하고 다음 명령을 수행한 뒤 새 passphrase로 재시작합니다.
 
@@ -202,14 +191,6 @@ CACHE_BACKEND=s3 S3_BUCKET=img-cache \
 CACHE_ENCRYPTION_OLD_PASSPHRASE='old passphrase' \
 CACHE_ENCRYPTION_NEW_PASSPHRASE='new long passphrase' \
 npm run change-passphrase
-```
-
-이전 버전의 `<object-key>.meta.json` sidecar가 있는 저장소는 서버 전환 전에 URL 기반
-온디맨드 index로 변환합니다. 기존 sidecar는 롤백을 위해 삭제하지 않습니다. 명령은
-재실행 가능하며 이미 존재하는 index는 건너뜁니다.
-
-```bash
-npm run migrate-index
 ```
 
 키 봉투의 고정 bootstrap 객체명, 객체 개수·크기·접근 시각은 저장소에 노출됩니다. 경로
@@ -226,49 +207,9 @@ HTTPS(또는 localhost)에서만 사용할 수 있습니다.
 복호화한 뒤 비교합니다. 복호화되지 않는 이름은 목록에서 제외합니다. 세그먼트 하나는 최대
 2047 byte이며, 암호화된 전체 key가 S3의 1024-byte 제한을 넘지 않아야 합니다.
 
-### v1(HMAC + manifest) → v2(EME 경로) 마이그레이션
-
-v1은 경로를 HMAC으로 단방향 변환하고 key 목록을 manifest·delta로 관리했습니다. 본문
-암호문 형식(`IPV1`, AES-GCM)은 v2와 동일하므로 객체를 새 이름으로 복사만 합니다(S3는
-서버 측 `CopyObject`). 프론트엔드는 바뀌지 않습니다. 명령은 재실행할 수 있으며 이미 v2에
-있는 객체는 건너뜁니다.
-
-1. 버킷 버전 관리 또는 백업을 켭니다.
-2. 기존(v1) 서버를 운영하는 상태에서 1차 복사를 합니다. `--dry-run`으로 수량을 먼저
-   확인할 수 있고, `--verify`는 복사한 객체를 내려받아 AES-GCM 인증까지 확인합니다.
-   ```bash
-   CACHE_BACKEND=s3 S3_BUCKET=img-cache \
-   CACHE_ENCRYPTION_PASSPHRASE='a long private passphrase' \
-   npm run migrate-paths -- --verify
-   ```
-3. v1 서버를 정지합니다(SIGINT/SIGTERM에서 대기 중인 delta를 flush). 같은 명령을 다시
-   실행해 1차 복사 이후 추가된 객체만 복사하고, v2 서버를 배포·시작합니다.
-4. 이미지 표시와 `list()`를 확인한 뒤 v1 객체(`objects/`, manifest, delta)를 삭제합니다.
-   복사 실패가 하나라도 있으면 삭제하지 않습니다. 삭제 전까지는 v1 서버로 롤백할 수
-   있으며, 그 사이 v2 서버가 새로 캐시한 이미지는 v1에서 cache miss로 다시 받아옵니다.
-   ```bash
-   npm run migrate-paths -- --delete-legacy
-   ```
-
-S3에서는 `--to-prefix`로 같은 버킷의 다른 prefix에 v2를 만들 수 있습니다. 키 봉투를 먼저
-복사하고(대상에 다른 봉투가 있으면 중단) 객체를 서버 측 `CopyObject`로 복사하며, 원본
-prefix는 수정하지 않습니다. 새 서버를 `S3_PREFIX=<새 prefix>`로 시작하면 무중단으로 전환되고,
-롤백은 `S3_PREFIX`를 되돌리는 것으로 끝납니다. 원본 prefix는 안정화 후 lifecycle 규칙 등으로
-통째로 삭제합니다(`--delete-legacy`와 함께 쓸 수 없음). 대규모 버킷에서 `--verify`는 모든
-객체를 내려받으므로 필요할 때만 사용합니다.
-
-```bash
-npm run migrate-paths -- --to-prefix img-preview-v2 --dry-run
-npm run migrate-paths -- --to-prefix img-preview-v2 --concurrency 32
-```
-
-`missing`은 manifest에는 있지만 v1 객체가 없는 key, `unreferencedLegacyObjects`는
-manifest에 없는 v1 객체(이름을 복원할 수 없음) 수입니다. 후자는 `--delete-legacy`에서 함께
-삭제됩니다.
-
 ## 백엔드 간 마이그레이션
 
-`npm run migrate -- <from> <to>`는 모든 오브젝트(이미지 + meta 사이드카)를 한 백엔드에서
+`npm run migrate -- <from> <to>`는 모든 오브젝트(이미지 + index)를 한 백엔드에서
 다른 백엔드로 복사합니다. `fs` 쪽은 `CACHE_DIR`, `s3` 쪽은 `S3_*` 변수로 설정됩니다.
 
 ```bash
@@ -294,8 +235,7 @@ npm run migrate -- s3 fs
 | `--encrypt-destination` | 목적지에 AES-GCM 암호문과 EME 암호화 경로로 기록 |
 
 마이그레이션은 멱등적입니다 — 재실행하면 `--overwrite`가 없는 한 대상에 이미 존재하는
-오브젝트를 건너뜁니다. 구 버전의 `.meta.json`을 옮긴 경우 `npm run migrate-index`를 한 번
-실행해야 새 서버가 URL 기반 index를 온디맨드로 조회할 수 있습니다.
+오브젝트를 건너뜁니다.
 
 ## 프로젝트 구조
 
@@ -305,7 +245,6 @@ src/
   cache-manager.ts     URL 기반 온디맨드 index + 메모리 hot cache
   download-manager.ts  origin fetch, 호스트별 throttle, PNG→WebP 변환
   migrate.ts           fs <-> s3 마이그레이션 CLI
-  migrate-paths.ts     암호화 경로 v1(HMAC + manifest) -> v2(EME) 마이그레이션 CLI
   storage/
     types.ts           ObjectStorage 인터페이스 + 백엔드 설정 타입
     fs-storage.ts      파일시스템 백엔드
@@ -314,7 +253,6 @@ src/
     encrypted-storage.ts  본문 AES-GCM + 경로 EME 암호화 어댑터
     crypto-format.ts   암호문 형식, 마스터키 봉투, PathCipher
     eme.ts             EME wide-block cipher (rfjakob/eme 호환)
-    legacy-v1.ts       v1 HMAC 경로·manifest 읽기 (마이그레이션 전용)
     index.ts           배럴 익스포트
 public/                정적 프론트엔드 (index.html, script.js, style.css)
 ```

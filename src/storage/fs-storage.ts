@@ -1,4 +1,4 @@
-import { access, copyFile, mkdir, readdir, readFile, rm, writeFile } from "fs/promises";
+import { access, mkdir, readdir, readFile, rm, writeFile } from "fs/promises";
 import path from "path";
 import type { ObjectStorage } from "./types";
 
@@ -55,12 +55,6 @@ export class FsStorage implements ObjectStorage {
 
   async delete(key: string): Promise<void> {
     await rm(this.toPath(key), { force: true });
-  }
-
-  async copy(fromKey: string, toKey: string): Promise<void> {
-    const toPath = this.toPath(toKey);
-    await mkdir(path.dirname(toPath), { recursive: true });
-    await copyFile(this.toPath(fromKey), toPath);
   }
 
   private async walk(dir: string): Promise<string[]> {
