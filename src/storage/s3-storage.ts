@@ -1,4 +1,5 @@
 import {
+  CopyObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
@@ -142,6 +143,20 @@ export class S3Storage implements ObjectStorage {
       new DeleteObjectCommand({
         Bucket: this.bucket,
         Key: this.toObjectKey(key),
+      })
+    );
+  }
+
+  async copy(fromKey: string, toKey: string): Promise<void> {
+    const sourcePath = `${this.bucket}/${this.toObjectKey(fromKey)}`
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+    await this.client.send(
+      new CopyObjectCommand({
+        Bucket: this.bucket,
+        Key: this.toObjectKey(toKey),
+        CopySource: sourcePath,
       })
     );
   }

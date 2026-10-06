@@ -1,5 +1,10 @@
 import { backendConfigFromEnv, createStorage, EncryptedStorage } from "./storage";
-import { MANIFEST_OBJECT, MASTER_KEY_OBJECT } from "./storage/crypto-format";
+import { ENCRYPTED_PATH_PREFIX, MASTER_KEY_OBJECT } from "./storage/crypto-format";
+import {
+  LEGACY_MANIFEST_DELTA_PREFIX,
+  LEGACY_MANIFEST_OBJECT,
+  LEGACY_OBJECT_PREFIX,
+} from "./storage/legacy-v1";
 
 async function main(): Promise<void> {
   const passphrase = process.env.CACHE_ENCRYPTION_PASSPHRASE;
@@ -11,8 +16,10 @@ async function main(): Promise<void> {
   const plaintextKeys = (await raw.list()).filter(
     (key) =>
       key !== MASTER_KEY_OBJECT &&
-      key !== MANIFEST_OBJECT &&
-      !key.startsWith("objects/")
+      !key.startsWith(ENCRYPTED_PATH_PREFIX) &&
+      key !== LEGACY_MANIFEST_OBJECT &&
+      !key.startsWith(LEGACY_MANIFEST_DELTA_PREFIX) &&
+      !key.startsWith(LEGACY_OBJECT_PREFIX)
   );
   const encrypted = new EncryptedStorage(raw, passphrase);
 

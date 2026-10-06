@@ -45,7 +45,7 @@ async function main(): Promise<void> {
     })
   );
 
-  const existing = await storage.findExisting(indexEntries.keys());
+  const existing = new Set(await storage.list("index/"));
   const entries = [...indexEntries].filter(([key]) => !existing.has(key));
   let completed = 0;
   for (let offset = 0; offset < entries.length; offset += 32) {
@@ -55,7 +55,7 @@ async function main(): Promise<void> {
         let lastError: unknown;
         for (let attempt = 1; attempt <= 3; attempt += 1) {
           try {
-            await storage.writeDeferred(key, data);
+            await storage.write(key, data, "application/json");
             return;
           } catch (error) {
             lastError = error;
@@ -76,11 +76,10 @@ async function main(): Promise<void> {
     }
   }
 
-  await storage.commitManifest(indexEntries.keys());
   // eslint-disable-next-line no-console
   console.log(
     `Index migration complete: legacy=${legacyKeys.length} unique=${indexEntries.size}` +
-      ` copied=${entries.length} skipped=${existing.size}`
+      ` copied=${entries.length} skipped=${indexEntries.size - entries.length}`
   );
 }
 

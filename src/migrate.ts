@@ -85,11 +85,7 @@ async function migrateKey(
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      if (dest instanceof EncryptedStorage) {
-        await dest.writeDeferred(key, data);
-      } else {
-        await dest.write(key, data, contentType);
-      }
+      await dest.write(key, data, contentType);
       return "copied";
     } catch (error) {
       lastError = error;
@@ -128,9 +124,11 @@ async function main(): Promise<void> {
   const keys = await source.list(options.prefix);
   // eslint-disable-next-line no-console
   console.log(`Found ${keys.length} objects to migrate`);
+  // Encrypted names are cheap to list and decrypt, so one listing replaces a
+  // HEAD request per key.
   const knownExisting =
     dest instanceof EncryptedStorage
-      ? await dest.findExisting(keys)
+      ? new Set(await dest.list(options.prefix))
       : undefined;
   if (knownExisting) {
     // eslint-disable-next-line no-console
@@ -140,7 +138,6 @@ async function main(): Promise<void> {
   let copied = 0;
   let skipped = 0;
   let failed = 0;
-  const manifestKeys: string[] = [];
   let lastReported = 0;
 
   for (let i = 0; i < keys.length; i += options.concurrency) {
@@ -158,10 +155,8 @@ async function main(): Promise<void> {
         console.error(`  FAIL ${batch[j]}: ${result.reason}`);
       } else if (result.value === "copied") {
         copied += 1;
-        manifestKeys.push(batch[j]);
       } else {
         skipped += 1;
-        manifestKeys.push(batch[j]);
       }
     }
     const completed = Math.min(i + options.concurrency, keys.length);
@@ -170,15 +165,6 @@ async function main(): Promise<void> {
       // eslint-disable-next-line no-console
       console.log(`  progress ${completed}/${keys.length}`);
     }
-  }
-
-  if (dest instanceof EncryptedStorage && !options.dryRun) {
-    // Commit once: uploading a growing manifest for every object is quadratic
-    // for large caches. A failed run can be safely resumed; existing opaque
-    // objects are detected and included in the next final manifest.
-    await dest.commitManifest(manifestKeys);
-    // eslint-disable-next-line no-console
-    console.log(`  encrypted manifest committed (${manifestKeys.length} keys)`);
   }
 
   // eslint-disable-next-line no-console

@@ -77,7 +77,7 @@ phase는 `queued`, `downloading`, `transforming`, `encrypting`, `uploading`, `in
 - `index/<sha256(url)>.json` — `{ url, key, contentType, updatedAt }`을 담는 index.
   요청 URL에서 key를 결정할 수 있어 서버 시작 시 전체 목록을 읽지 않습니다. 첫 요청에서
   해당 index 하나만 읽고 이후에는 메모리에 유지합니다. 암호화 backend에서는 이 논리
-  key도 다시 HMAC opaque key로 변환됩니다.
+  key도 다시 경로 세그먼트별 EME 암호화 key로 변환됩니다.
 
 `ObjectStorage` 인터페이스(`src/storage/types.ts`)에는 두 가지 구현이 있습니다.
 
@@ -158,11 +158,12 @@ npm start
 ## 비신뢰 저장소 암호화
 
 `CACHE_ENCRYPTION=true`는 랜덤 256-bit 마스터키로 모든 이미지와 메타데이터를
-AES-256-GCM 암호화합니다. 논리 key는 마스터키 기반 HMAC-SHA-256으로 변환되므로 S3에는
-원본 호스트, 경로, 확장자가 나타나지 않습니다. 브라우저는 최초 이미지 표시 때
+AES-256-GCM 암호화합니다. 논리 key는 rclone crypt와 같은 방식으로 `/` 세그먼트마다
+PKCS#7 패딩 후 EME(AES-256, 고정 tweak)로 암호화하고 소문자 base32hex로 인코딩해
+`v2/` 아래에 저장하므로 S3에는 원본 호스트, 경로, 확장자가 나타나지 않습니다. 브라우저는 최초 이미지 표시 때
 passphrase를 묻고, PBKDF2-SHA256(기본 600,000회)으로 S3에 저장된 마스터키 봉투를
 해제합니다. 해제된 키는 현재 페이지의 메모리에만 유지됩니다.
-AES content key와 경로 HMAC key는 HKDF-SHA256으로 마스터키에서 서로 독립적으로
+AES content key와 경로 EME key·tweak은 HKDF-SHA256으로 마스터키에서 서로 독립적으로
 파생됩니다.
 브라우저의 Encryption key 패널에서 passphrase를 검증해 `localStorage`에 기억하거나
 삭제하고 잠글 수 있습니다. 같은 origin에서 실행되는 JavaScript는 저장된 passphrase를
@@ -180,7 +181,7 @@ S3_BUCKET=img-cache npm start
 ```
 
 기존 평문 캐시는 서버를 정지한 상태에서 같은 백엔드 안에서 변환합니다. 각 객체는
-암호화본과 manifest 쓰기가 성공한 뒤 평문이 삭제되므로 중단 후 재실행할 수 있습니다.
+암호화본 쓰기가 성공한 뒤 평문이 삭제되므로 중단 후 재실행할 수 있습니다.
 첫 실행 전 버킷 버전 관리나 별도 백업을 권장합니다. `--keep-plaintext`를 붙이면 평문을
 삭제하지 않습니다.
 
@@ -208,23 +209,59 @@ npm run change-passphrase
 npm run migrate-index
 ```
 
-키 봉투와 암호화 manifest의 고정 bootstrap 객체명, 객체 개수·크기·접근 시각은 저장소에
-노출됩니다. 실제 데이터 경로와 manifest 내용은 노출되지 않습니다. 브라우저 Web Crypto는
+키 봉투의 고정 bootstrap 객체명, 객체 개수·크기·접근 시각은 저장소에 노출됩니다. 경로
+암호화는 결정적이므로 경로 depth, 같은 이름의 세그먼트(예: 같은 호스트 디렉터리 아래
+객체들), 16-byte 단위로 반올림한 세그먼트 길이도 드러납니다. 실제 호스트·경로·파일명은
+노출되지 않습니다. EME 이름에는 인증 태그가 없으므로 저장소 쓰기 권한자가 객체 이름을
+서로 바꾸는 공격은 막지 않습니다(본문은 AES-GCM으로 인증됨). 브라우저 Web Crypto는
 HTTPS(또는 localhost)에서만 사용할 수 있습니다.
 최초 키 봉투 생성은 단일 서버 인스턴스로 수행해야 합니다. 잘못된 passphrase나 손상된
 키 봉투가 감지되면 서버는 평문 fallback 없이 시작에 실패합니다.
 
-전체 logical key 목록은 암호화된 base manifest와 append-only delta로 관리합니다. 일반
-이미지 저장은 변경 key를 메모리에서 최대 1초간 모아 작은 delta 하나로 기록하므로 base
-manifest를 읽거나 다시 업로드하지 않습니다. 같은 key의 add/delete는 마지막 상태로
-합쳐집니다. 정상 종료(SIGINT/SIGTERM), `list()`, bulk commit, compaction에서는 대기 중인
-delta를 즉시 flush합니다.
-`list()`가 필요한 관리 작업에서만 base와 delta를 합칩니다. delta가 많이 쌓였을 때는
-서버를 정지한 뒤 다음 명령으로 새 base snapshot에 합칠 수 있습니다.
+경로를 복호화할 수 있으므로 별도 manifest 없이 `list()`가 동작합니다. 논리 prefix의 완전한
+세그먼트는 암호화해 S3 `ListObjectsV2` prefix로 범위를 좁히고, 마지막 부분 세그먼트는 이름을
+복호화한 뒤 비교합니다. 복호화되지 않는 이름은 목록에서 제외합니다. 세그먼트 하나는 최대
+2047 byte이며, 암호화된 전체 key가 S3의 1024-byte 제한을 넘지 않아야 합니다.
+
+### v1(HMAC + manifest) → v2(EME 경로) 마이그레이션
+
+v1은 경로를 HMAC으로 단방향 변환하고 key 목록을 manifest·delta로 관리했습니다. 본문
+암호문 형식(`IPV1`, AES-GCM)은 v2와 동일하므로 객체를 새 이름으로 복사만 합니다(S3는
+서버 측 `CopyObject`). 프론트엔드는 바뀌지 않습니다. 명령은 재실행할 수 있으며 이미 v2에
+있는 객체는 건너뜁니다.
+
+1. 버킷 버전 관리 또는 백업을 켭니다.
+2. 기존(v1) 서버를 운영하는 상태에서 1차 복사를 합니다. `--dry-run`으로 수량을 먼저
+   확인할 수 있고, `--verify`는 복사한 객체를 내려받아 AES-GCM 인증까지 확인합니다.
+   ```bash
+   CACHE_BACKEND=s3 S3_BUCKET=img-cache \
+   CACHE_ENCRYPTION_PASSPHRASE='a long private passphrase' \
+   npm run migrate-paths -- --verify
+   ```
+3. v1 서버를 정지합니다(SIGINT/SIGTERM에서 대기 중인 delta를 flush). 같은 명령을 다시
+   실행해 1차 복사 이후 추가된 객체만 복사하고, v2 서버를 배포·시작합니다.
+4. 이미지 표시와 `list()`를 확인한 뒤 v1 객체(`objects/`, manifest, delta)를 삭제합니다.
+   복사 실패가 하나라도 있으면 삭제하지 않습니다. 삭제 전까지는 v1 서버로 롤백할 수
+   있으며, 그 사이 v2 서버가 새로 캐시한 이미지는 v1에서 cache miss로 다시 받아옵니다.
+   ```bash
+   npm run migrate-paths -- --delete-legacy
+   ```
+
+S3에서는 `--to-prefix`로 같은 버킷의 다른 prefix에 v2를 만들 수 있습니다. 키 봉투를 먼저
+복사하고(대상에 다른 봉투가 있으면 중단) 객체를 서버 측 `CopyObject`로 복사하며, 원본
+prefix는 수정하지 않습니다. 새 서버를 `S3_PREFIX=<새 prefix>`로 시작하면 무중단으로 전환되고,
+롤백은 `S3_PREFIX`를 되돌리는 것으로 끝납니다. 원본 prefix는 안정화 후 lifecycle 규칙 등으로
+통째로 삭제합니다(`--delete-legacy`와 함께 쓸 수 없음). 대규모 버킷에서 `--verify`는 모든
+객체를 내려받으므로 필요할 때만 사용합니다.
 
 ```bash
-npm run compact-manifest
+npm run migrate-paths -- --to-prefix img-preview-v2 --dry-run
+npm run migrate-paths -- --to-prefix img-preview-v2 --concurrency 32
 ```
+
+`missing`은 manifest에는 있지만 v1 객체가 없는 key, `unreferencedLegacyObjects`는
+manifest에 없는 v1 객체(이름을 복원할 수 없음) 수입니다. 후자는 `--delete-legacy`에서 함께
+삭제됩니다.
 
 ## 백엔드 간 마이그레이션
 
@@ -251,7 +288,7 @@ npm run migrate -- s3 fs
 | `--overwrite`        | 대상에 이미 존재하는 오브젝트를 덮어씀 (기본: 건너뜀) |
 | `--dry-run`          | 쓰기 없이 나열/카운트만 수행 |
 | `--concurrency <n>`  | 배치당 병렬 복사 수 (기본 `8`) |
-| `--encrypt-destination` | 목적지에 AES-GCM 암호문과 HMAC 기반 opaque key로 기록 |
+| `--encrypt-destination` | 목적지에 AES-GCM 암호문과 EME 암호화 경로로 기록 |
 
 마이그레이션은 멱등적입니다 — 재실행하면 `--overwrite`가 없는 한 대상에 이미 존재하는
 오브젝트를 건너뜁니다. 구 버전의 `.meta.json`을 옮긴 경우 `npm run migrate-index`를 한 번
@@ -265,11 +302,16 @@ src/
   cache-manager.ts     URL 기반 온디맨드 index + 메모리 hot cache
   download-manager.ts  origin fetch, 호스트별 throttle, PNG→WebP 변환
   migrate.ts           fs <-> s3 마이그레이션 CLI
+  migrate-paths.ts     암호화 경로 v1(HMAC + manifest) -> v2(EME) 마이그레이션 CLI
   storage/
     types.ts           ObjectStorage 인터페이스 + 백엔드 설정 타입
     fs-storage.ts      파일시스템 백엔드
     s3-storage.ts      S3 호환 백엔드
     factory.ts         환경 변수 기반 백엔드 선택
+    encrypted-storage.ts  본문 AES-GCM + 경로 EME 암호화 어댑터
+    crypto-format.ts   암호문 형식, 마스터키 봉투, PathCipher
+    eme.ts             EME wide-block cipher (rfjakob/eme 호환)
+    legacy-v1.ts       v1 HMAC 경로·manifest 읽기 (마이그레이션 전용)
     index.ts           배럴 익스포트
 public/                정적 프론트엔드 (index.html, script.js, style.css)
 ```

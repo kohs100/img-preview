@@ -36,6 +36,12 @@ export interface ObjectStorage {
   delete(key: string): Promise<void>;
 
   /**
+   * Optional. Copy an object's bytes inside the same backend without
+   * downloading them (S3 CopyObject). Callers fall back to read + write.
+   */
+  copy?(fromKey: string, toKey: string): Promise<void>;
+
+  /**
    * Optional. Return a browser-reachable URL the client can be redirected to
    * (public object URL or presigned URL), so the app server can offload the
    * actual byte transfer. Backends that cannot serve objects directly (or are

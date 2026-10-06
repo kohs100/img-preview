@@ -1,22 +1,22 @@
 import {
   createCipheriv,
   createDecipheriv,
-  createHmac,
   hkdfSync,
   pbkdf2Sync,
   randomBytes,
 } from "crypto";
+import { Eme, EME_MAX_BYTES } from "./eme";
 
 export const ENCRYPTED_OBJECT_MAGIC = Buffer.from("IPV1");
 export const MASTER_KEY_OBJECT = ".img-preview-key-v1.json";
-export const MANIFEST_OBJECT = ".img-preview-manifest-v1";
-export const MANIFEST_DELTA_PREFIX = ".img-preview-manifest-delta-v1/";
+/** Every object stored under an EME-encrypted (reversible) path lives here. */
+export const ENCRYPTED_PATH_PREFIX = "v2/";
 export const DEFAULT_PBKDF2_ITERATIONS = 600_000;
 const HKDF_SALT = Buffer.from("img-preview-v1");
 
-function deriveSubkey(masterKey: Buffer, purpose: string): Buffer {
+function deriveSubkey(masterKey: Buffer, purpose: string, length = 32): Buffer {
   return Buffer.from(
-    hkdfSync("sha256", masterKey, HKDF_SALT, Buffer.from(purpose), 32)
+    hkdfSync("sha256", masterKey, HKDF_SALT, Buffer.from(purpose), length)
   );
 }
 
@@ -24,9 +24,6 @@ export function deriveContentKey(masterKey: Buffer): Buffer {
   return deriveSubkey(masterKey, "content-encryption");
 }
 
-function derivePathKey(masterKey: Buffer): Buffer {
-  return deriveSubkey(masterKey, "path-hmac");
-}
 
 export type MasterKeyEnvelope = {
   version: 1;
@@ -78,11 +75,118 @@ export function decryptObject(payload: Buffer, masterKey: Buffer): Buffer {
   );
 }
 
-export function opaqueObjectKey(logicalKey: string, masterKey: Buffer): string {
-  const digest = createHmac("sha256", derivePathKey(masterKey))
-    .update(logicalKey)
-    .digest("base64url");
-  return `objects/${digest}`;
+/**
+ * Reversible, deterministic path encryption in the style of rclone crypt:
+ * every "/"-separated segment is PKCS#7 padded, EME-encrypted with one fixed
+ * tweak and encoded as unpadded lowercase base32hex. Depth and equal segment
+ * names stay visible; segment contents and lengths beyond 16-byte blocks do not.
+ */
+export class PathCipher {
+  private readonly eme: Eme;
+
+  private readonly tweak: Buffer;
+
+  constructor(masterKey: Buffer) {
+    const material = deriveSubkey(masterKey, "path-eme-v2", 48);
+    this.eme = new Eme(material.subarray(0, 32));
+    this.tweak = material.subarray(32);
+  }
+
+  encryptKey(logicalKey: string): string {
+    return ENCRYPTED_PATH_PREFIX + this.encryptSegments(logicalKey.split("/"));
+  }
+
+  /** Encrypted form of whole leading segments, for prefix listing. */
+  encryptSegments(segments: string[]): string {
+    return segments.map((segment) => this.encryptSegment(segment)).join("/");
+  }
+
+  /** Returns null for names that are not valid encrypted paths. */
+  decryptKey(physicalKey: string): string | null {
+    if (!physicalKey.startsWith(ENCRYPTED_PATH_PREFIX)) return null;
+    const segments: string[] = [];
+    for (const encoded of physicalKey.slice(ENCRYPTED_PATH_PREFIX.length).split("/")) {
+      const segment = this.decryptSegment(encoded);
+      if (segment === null) return null;
+      segments.push(segment);
+    }
+    return segments.join("/");
+  }
+
+  private encryptSegment(segment: string): string {
+    if (!segment) throw new Error("Storage keys must not contain empty path segments");
+    const plaintext = Buffer.from(segment, "utf8");
+    const padding = 16 - (plaintext.length % 16);
+    const padded = Buffer.concat([plaintext, Buffer.alloc(padding, padding)]);
+    if (padded.length > EME_MAX_BYTES) {
+      throw new Error(`Storage key segment is too long to encrypt (${plaintext.length} bytes)`);
+    }
+    return encodeBase32Hex(this.eme.encrypt(this.tweak, padded));
+  }
+
+  private decryptSegment(encoded: string): string | null {
+    const ciphertext = decodeBase32Hex(encoded);
+    if (
+      !ciphertext ||
+      ciphertext.length === 0 ||
+      ciphertext.length % 16 !== 0 ||
+      ciphertext.length > EME_MAX_BYTES
+    ) {
+      return null;
+    }
+    const padded = this.eme.decrypt(this.tweak, ciphertext);
+    const padding = padded[padded.length - 1];
+    if (padding < 1 || padding > 16) return null;
+    for (let i = padded.length - padding; i < padded.length; i += 1) {
+      if (padded[i] !== padding) return null;
+    }
+    try {
+      const segment = UTF8.decode(padded.subarray(0, padded.length - padding));
+      return segment && !segment.includes("/") ? segment : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+const UTF8 = new TextDecoder("utf-8", { fatal: true });
+const BASE32HEX = "0123456789abcdefghijklmnopqrstuv";
+
+function encodeBase32Hex(data: Buffer): string {
+  let out = "";
+  let bits = 0;
+  let value = 0;
+  for (const byte of data) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += BASE32HEX[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+    value &= (1 << bits) - 1;
+  }
+  if (bits > 0) out += BASE32HEX[(value << (5 - bits)) & 31];
+  return out;
+}
+
+/** Strict decoder: only canonical lowercase, unpadded encodings round-trip. */
+function decodeBase32Hex(text: string): Buffer | null {
+  const bytes: number[] = [];
+  let bits = 0;
+  let value = 0;
+  for (const char of text) {
+    const digit = BASE32HEX.indexOf(char);
+    if (digit < 0) return null;
+    value = (value << 5) | digit;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+    value &= (1 << bits) - 1;
+  }
+  const data = Buffer.from(bytes);
+  return encodeBase32Hex(data) === text ? data : null;
 }
 
 export function wrapMasterKey(
