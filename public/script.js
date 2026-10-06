@@ -8,6 +8,7 @@ const statusEl = document.getElementById("status");
 const modeLabelEl = document.getElementById("modeLabel");
 const listEl = document.getElementById("list");
 const backButton = document.getElementById("backButton");
+const downloadAllButton = document.getElementById("downloadAllButton");
 const encryptionPanel = document.getElementById("encryptionPanel");
 const encryptionForm = document.getElementById("encryptionForm");
 const encryptionPassphrase = document.getElementById("encryptionPassphrase");
@@ -22,6 +23,10 @@ let currentView = {
   clothesIndex: null,
 };
 const POLL_INTERVAL_MS = 1200;
+const DOWNLOAD_POLL_INTERVAL_MS = 1500;
+const DOWNLOAD_BATCH_SIZE = 200;
+// Bumped whenever the list is replaced so a running download poll stops.
+let downloadSession = 0;
 const MAX_POLL_RETRY = 60;
 const textEncoder = new TextEncoder();
 const PASSPHRASE_STORAGE_KEY = "img-preview.cache-passphrase.v1";
@@ -456,7 +461,9 @@ async function setImagePolling(img, cachedUrl, onProgress) {
 }
 
 function clearList() {
+  downloadSession += 1;
   listEl.innerHTML = "";
+  listEl.classList.remove("download-grid");
 }
 
 function saveStateToQuery() {
@@ -490,12 +497,15 @@ function restoreFormFromQuery() {
   clothesInput.value = params.get("clothes") || "";
   typeInput.value = params.get("type") || "";
   templateInput.value = params.get("template") || "";
-  const referrer = params.get("referrer");
-  if (referrer === "genit.ai" || referrer === "babechat.ai") {
-    referrerSelect.value = referrer;
-  } else {
-    referrerSelect.value = "babechat.ai";
-  }
+  // Option values are full origins ("https://babechat.ai/"); older links
+  // stored bare hosts ("babechat.ai"), so compare by host.
+  const toHost = (value) =>
+    value.replace(/^https?:\/\//i, "").replace(/\/+$/, "").toLowerCase();
+  const referrerHost = toHost(params.get("referrer") || "");
+  const match = Array.from(referrerSelect.options).find(
+    (option) => toHost(option.value) === referrerHost
+  );
+  referrerSelect.value = match ? match.value : referrerSelect.options[0].value;
 }
 
 function buildTypeViewHref(characterIndex, clothesIndex) {
@@ -565,6 +575,7 @@ function renderMainList() {
   clearList();
   modeLabelEl.textContent = "Main List: f(*, *, 0)";
   backButton.hidden = true;
+  downloadAllButton.hidden = false;
   currentView = {
     mode: "main",
     characterIndex: null,
@@ -593,6 +604,7 @@ function renderMainList() {
 function renderTypeList(characterIndex, clothesIndex) {
   clearList();
   backButton.hidden = false;
+  downloadAllButton.hidden = true;
   currentView = {
     mode: "type",
     characterIndex,
@@ -617,6 +629,178 @@ function renderTypeList(characterIndex, clothesIndex) {
     });
     listEl.appendChild(card);
   }
+}
+
+function formatDownloadCell(result) {
+  if (result.status === "ready") return "Ready";
+  if (result.status === "error") {
+    return Number.isInteger(result.errorStatusCode)
+      ? `Failed (${result.errorStatusCode})`
+      : "Failed";
+  }
+  return formatProgress(result);
+}
+
+/**
+ * Download view: asks the server to cache every f(*, *, *) image and shows
+ * only per-image status, without transferring or decrypting image bytes.
+ */
+function renderDownloadView() {
+  clearList();
+  backButton.hidden = false;
+  downloadAllButton.hidden = true;
+  currentView = {
+    mode: "download",
+    characterIndex: null,
+    clothesIndex: null,
+  };
+  saveStateToQuery();
+  listEl.classList.add("download-grid");
+
+  const items = [];
+  for (let ch = 0; ch < state.characters.length; ch += 1) {
+    for (let cl = 0; cl < state.clothes.length; cl += 1) {
+      for (let ty = 0; ty < state.types.length; ty += 1) {
+        const label = [state.characters[ch], state.clothes[cl], state.types[ty]]
+          .filter(Boolean)
+          .join("-");
+        const cell = document.createElement("div");
+        cell.className = "download-cell";
+        cell.dataset.status = "processing";
+        const name = document.createElement("div");
+        name.className = "download-name";
+        name.textContent = label;
+        const statusText = document.createElement("div");
+        statusText.className = "download-status";
+        statusText.textContent = "Queued…";
+        const bar = document.createElement("div");
+        bar.className = "download-bar";
+        cell.append(name, statusText, bar);
+        items.push({
+          path: buildUrl(ch, cl, ty).replace(/^https?:\/\//i, ""),
+          cell,
+          statusText,
+          bar,
+          done: false,
+        });
+      }
+    }
+  }
+  modeLabelEl.textContent = `Download: f(*, *, *) | ${items.length} images`;
+
+  const summary = document.createElement("div");
+  summary.className = "download-summary";
+  const summaryText = document.createElement("span");
+  const retryButton = document.createElement("button");
+  retryButton.type = "button";
+  retryButton.className = "secondary";
+  retryButton.textContent = "Retry failed";
+  retryButton.hidden = true;
+  const summaryBar = document.createElement("div");
+  summaryBar.className = "download-bar";
+  summary.append(summaryText, retryButton, summaryBar);
+  listEl.appendChild(summary);
+  for (const item of items) listEl.appendChild(item.cell);
+
+  const startedAt = Date.now();
+  let lastError = "";
+  const updateSummary = () => {
+    let ready = 0;
+    let failed = 0;
+    for (const item of items) {
+      if (item.cell.dataset.status === "ready") ready += 1;
+      else if (item.cell.dataset.status === "error") failed += 1;
+    }
+    const finished = ready + failed;
+    const pending = items.length - finished;
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    summaryText.textContent =
+      `Ready ${ready} / ${items.length} · Processing ${pending} · Failed ${failed}` +
+      ` · ${elapsed}s` +
+      (pending === 0 ? " · Done" : "") +
+      (lastError ? ` · ${lastError}` : "");
+    summaryBar.style.width = `${items.length ? (finished / items.length) * 100 : 100}%`;
+    retryButton.hidden = failed === 0;
+  };
+
+  const applyResult = (item, result) => {
+    const status = result.status === "ready" || result.status === "error"
+      ? result.status
+      : "processing";
+    item.cell.dataset.status = status;
+    item.done = status !== "processing";
+    item.statusText.textContent = formatDownloadCell(result);
+    item.cell.title = status === "error" && result.message ? result.message : "";
+    item.bar.style.width = status === "processing" && Number.isFinite(result.percent)
+      ? `${result.percent}%`
+      : status === "processing" ? "0%" : "100%";
+  };
+
+  const session = downloadSession;
+  let polling = false;
+  // A running loop re-reads pending items on every pass, so retried items
+  // are picked up without starting a second loop.
+  const poll = async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      await pollLoop();
+    } finally {
+      polling = false;
+    }
+  };
+  const pollLoop = async () => {
+    while (session === downloadSession) {
+      const pending = items.filter((item) => !item.done);
+      if (pending.length === 0) break;
+      lastError = "";
+      for (let offset = 0; offset < pending.length; offset += DOWNLOAD_BATCH_SIZE) {
+        if (session !== downloadSession) return;
+        const batch = pending.slice(offset, offset + DOWNLOAD_BATCH_SIZE);
+        try {
+          const response = await fetch("/api/cache-status", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              urls: batch.map((item) => item.path),
+              referrer: selectedReferrer(),
+            }),
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const { results } = await response.json();
+          if (session !== downloadSession) return;
+          batch.forEach((item, index) => applyResult(item, results[index] || {}));
+        } catch (error) {
+          lastError = `Status request failed: ${error instanceof Error ? error.message : error}`;
+        }
+        updateSummary();
+      }
+      if (items.every((item) => item.done)) break;
+      await new Promise((resolve) => setTimeout(resolve, DOWNLOAD_POLL_INTERVAL_MS));
+    }
+    if (session === downloadSession) updateSummary();
+  };
+
+  retryButton.addEventListener("click", async () => {
+    retryButton.disabled = true;
+    const failed = items.filter((item) => item.cell.dataset.status === "error");
+    const params = new URLSearchParams({ referrer: selectedReferrer() });
+    // /refresh restarts the fill even while the error is still cached.
+    await Promise.all(failed.map(async (item) => {
+      try {
+        await fetch(`/refresh/${item.path}?${params.toString()}`, { cache: "no-store" });
+      } catch {
+        // The next poll reports the item's state either way.
+      }
+      applyResult(item, { status: "processing", phase: "queued" });
+    }));
+    retryButton.disabled = false;
+    updateSummary();
+    if (session === downloadSession) void poll();
+  });
+
+  updateSummary();
+  void poll();
 }
 
 form.addEventListener("submit", (event) => {
@@ -669,6 +853,12 @@ form.addEventListener("submit", (event) => {
 backButton.addEventListener("click", () => {
   if (!state) return;
   renderMainList();
+});
+
+downloadAllButton.addEventListener("click", () => {
+  if (!state) return;
+  setStatus("");
+  renderDownloadView();
 });
 
 encryptionForm.addEventListener("submit", async (event) => {
@@ -740,6 +930,14 @@ function hydrateFromQuery() {
   const mode = params.get("mode");
   const chIndex = Number(params.get("chIndex"));
   const clIndex = Number(params.get("clIndex"));
+
+  if (mode === "download") {
+    renderDownloadView();
+    setStatus(
+      `Restored tokens: character=${characters.length}, clothes=${clothes.length}, type=${types.length}`
+    );
+    return;
+  }
 
   if (
     mode === "type" &&

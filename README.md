@@ -13,7 +13,10 @@ PNG는 WebP로 변환한 뒤 캐시에 저장합니다. 캐시는 **로컬 파�
    페이지입니다. 토큰은 범위(`1..4`)와 leading-zero 패딩을 지원하며, 범위 시작값에
    prefix를 붙일 수도 있습니다(`a1..3` → `a1,a2,a3`). 페이지는 템플릿을 이미지 URL
    그리드로 확장하고, 각 이미지를 캐시 엔드포인트로 지연 로딩하면서 아직 가져오는
-   중이면 폴링합니다.
+   중이면 폴링합니다. 메인 목록의 **Download All**은 `mode=download` 페이지로 이동해 모든
+   `캐릭터×의상×상황` 조합을 서버에 캐시하도록 요청하고, 이미지를 내려받지 않은 채 각
+   조합의 상태(대기·진행률·완료·실패)만 그리드로 보여줍니다. 실패한 항목은 `/refresh`로 다시
+   시도할 수 있습니다.
 2. **백엔드** (`src/`) — 캐시된 이미지를 서빙하고, 미스 발생 시 on-demand로 origin에서
    받아와 설정된 스토리지 백엔드에 저장하는 Express 서버입니다.
 
@@ -34,6 +37,7 @@ PNG는 WebP로 변환한 뒤 캐시에 저장합니다. 캐시는 **로컬 파�
 | `GET /cached/:imageUrl(*)?referrer=` | 캐시 적중 시 `200`; 처리 중이면 phase와 byte 진행도를 담은 `503` JSON, 실패 시 origin 에러 상태 |
 | `GET /refresh/:imageUrl(*)?referrer=` | 강제 재fetch 후 처리 상태 `503` JSON 반환 |
 | `POST /api/submissions`             | `204`; 프론트엔드 폼 제출을 로깅 |
+| `POST /api/cache-status`            | `{ urls, referrer }`(최대 500개)를 받아 캐시되지 않은 URL의 fetch를 시작하고, 입력 순서대로 `{ results: [{ status, phase, percent?, errorStatusCode?, message? }] }` 반환. 이미지 바이트는 보내지 않음 |
 
 `:imageUrl`은 origin URL입니다. route가 `(*)` 와일드카드라 슬래시 포함 경로를 그대로
 받고, 서버의 `normalizeUrl`이 scheme이 없으면 `https://`를 보충합니다. 따라서
@@ -47,6 +51,9 @@ query/hash를 제거한 것이며, 스토리지 백엔드를 바꿔도 이 계�
 > 안전합니다. 다만 origin 경로에 `#`(브라우저가 fragment로 처리해 서버로 전송 안 됨),
 > 리터럴 `%`(잘못된 percent-encoding으로 해석될 수 있음), 공백/비-ASCII 등이 들어가면
 > 깨질 수 있으니 그런 경우엔 `encodeURIComponent`가 필요합니다.
+
+`/api/cache-status`의 `urls`는 `/cached` 경로와 같은 형식(scheme 생략 가능, query/hash
+무시, percent-decode)으로 해석되므로 같은 캐시 key를 공유합니다.
 
 처리 중 응답 예시입니다. `Content-Length`를 제공하지 않는 origin이나 Sharp 변환,
 암호화·업로드·index 단계는 정확한 퍼센트 없이 phase만 반환합니다.

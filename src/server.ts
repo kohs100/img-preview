@@ -1,6 +1,6 @@
 import express from "express";
 import net from "net";
-import { CacheManager } from "./cache-manager";
+import { type CacheEntry, CacheManager } from "./cache-manager";
 import { DownloadManager, UpstreamHttpError } from "./download-manager";
 import { backendConfigFromEnv, createStorage, EncryptedStorage } from "./storage";
 
@@ -42,9 +42,8 @@ app.get("/", (_req, res) => {
 });
 
 app.use("/static", express.static("public"));
-app.use(express.json({ limit: "64kb" }));
 
-app.post("/api/submissions", (req, res) => {
+app.post("/api/submissions", express.json({ limit: "64kb" }), (req, res) => {
   const timestamp = new Date().toISOString();
   const payload = req.body && typeof req.body === "object" ? req.body : {};
   // eslint-disable-next-line no-console
@@ -128,21 +127,67 @@ function startDownload(cacheKey: string, fetchUrl: string, referrer: string): vo
     });
 }
 
-function sendProcessing(res: express.Response, entry?: ReturnType<CacheManager["getCached"]>): void {
+function processingPayload(entry?: CacheEntry) {
   const completedBytes = entry?.completedBytes;
   const totalBytes = entry?.totalBytes;
   const percent =
     completedBytes !== undefined && totalBytes !== undefined && totalBytes > 0
       ? Math.min(100, Math.round((completedBytes / totalBytes) * 100))
       : undefined;
-  res.setHeader("Retry-After", "1");
-  res.status(503).json({
-    status: "processing",
+  return {
+    status: "processing" as const,
     phase: entry?.phase ?? "queued",
     completedBytes,
     totalBytes,
     percent,
-  });
+  };
+}
+
+function errorPayload(entry: CacheEntry) {
+  return {
+    status: "error" as const,
+    phase: "failed" as const,
+    errorStatusCode: entry.errorStatusCode ?? 502,
+    message: entry.errorMessage || "Upstream fetch failed",
+  };
+}
+
+function sendProcessing(res: express.Response, entry?: CacheEntry): void {
+  res.setHeader("Retry-After", "1");
+  res.status(503).json(processingPayload(entry));
+}
+
+/**
+ * Starts a cache fill for a URL that is not cached yet or whose cached error
+ * is older than ERROR_RETRY_MS, and returns the entry to report. Ready
+ * entries, running fills and fresh errors are returned unchanged.
+ */
+function ensureFill(
+  cacheKey: string,
+  fetchUrl: string,
+  referrer: string,
+  entry: CacheEntry | undefined
+): CacheEntry | undefined {
+  if (entry?.status === "ready" || entry?.status === "processing") return entry;
+  if (entry?.status === "error") {
+    const errorAgeMs = Date.now() - entry.updatedAt;
+    if (!(errorRetryMs > 0 && errorAgeMs >= errorRetryMs)) return entry;
+    // Cached error is stale; retry the origin instead of serving it again.
+    startDownload(cacheKey, fetchUrl, referrer);
+  } else if (cacheManager.claimProcessing(cacheKey)) {
+    startDownload(cacheKey, fetchUrl, referrer);
+  }
+  return cacheManager.getCached(cacheKey);
+}
+
+function resolveImage(
+  rawPath: string,
+  referrerQuery: string
+): { cacheKey: string; fetchUrl: string; referrer: string } {
+  const fetchUrl = normalizeUrl(rawPath);
+  const cacheKey = toCacheKey(fetchUrl);
+  const referrer = referrerQuery ? normalizeUrl(referrerQuery) : "https://babechat.ai";
+  return { cacheKey, fetchUrl, referrer };
 }
 
 function resolveRequestParams(req: express.Request): {
@@ -154,13 +199,7 @@ function resolveRequestParams(req: express.Request): {
   if (!rawPath) {
     return null;
   }
-
-  const fetchUrl = normalizeUrl(rawPath);
-  const cacheKey = toCacheKey(fetchUrl);
-  const referrerQuery = firstQueryValue(req.query.referrer);
-  const referrer = referrerQuery ? normalizeUrl(referrerQuery) : "https://babechat.ai";
-
-  return { cacheKey, fetchUrl, referrer };
+  return resolveImage(rawPath, firstQueryValue(req.query.referrer));
 }
 
 app.get("/cached/:imageUrl(*)", async (req, res) => {
@@ -219,34 +258,84 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
     return;
   }
 
-  if (entry?.status === "processing") {
-    sendProcessing(res, entry);
+  // Start processing (or keep waiting) and return 503 until done
+  const current = ensureFill(cacheKey, fetchUrl, referrer, entry);
+  if (current?.status === "error") {
+    res.status(current.errorStatusCode ?? 502).json(errorPayload(current));
     return;
   }
+  sendProcessing(res, current);
+});
 
-  if (entry?.status === "error") {
-    const errorAgeMs = Date.now() - entry.updatedAt;
-    if (errorRetryMs > 0 && errorAgeMs >= errorRetryMs) {
-      // Cached error is stale; retry the origin instead of serving it again.
-      startDownload(cacheKey, fetchUrl, referrer);
-      sendProcessing(res, cacheManager.getCached(cacheKey));
+const CACHE_STATUS_MAX_URLS = 500;
+
+/**
+ * Batch status for the download page: starts fills for uncached URLs and
+ * reports each URL's state without transferring image bytes. URLs use the
+ * same form as the /cached path (scheme optional, query/hash ignored).
+ */
+app.post(
+  "/api/cache-status",
+  express.json({ limit: "1mb" }),
+  async (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const body = (req.body ?? {}) as { urls?: unknown; referrer?: unknown };
+    const urls = body.urls;
+    if (
+      !Array.isArray(urls) ||
+      urls.length === 0 ||
+      urls.length > CACHE_STATUS_MAX_URLS ||
+      !urls.every((url) => typeof url === "string" && url.length > 0)
+    ) {
+      res.status(400).json({
+        error: `urls must be 1..${CACHE_STATUS_MAX_URLS} non-empty strings`,
+      });
       return;
     }
-    res.status(entry.errorStatusCode ?? 502).json({
-      status: "error",
-      phase: "failed",
-      errorStatusCode: entry.errorStatusCode ?? 502,
-      message: entry.errorMessage || "Upstream fetch failed",
-    });
-    return;
-  }
+    const referrerQuery = typeof body.referrer === "string" ? body.referrer : "";
 
-  // Start processing and return 503 until done
-  if (cacheManager.claimProcessing(cacheKey)) {
-    startDownload(cacheKey, fetchUrl, referrer);
+    const results = new Array<unknown>(urls.length);
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(32, urls.length) }, async () => {
+        for (;;) {
+          const index = next;
+          next += 1;
+          if (index >= urls.length) return;
+          try {
+            // Mirror /cached: the browser drops ?query/#hash from the path
+            // and Express percent-decodes the route parameter.
+            const rawPath = decodeURIComponent(
+              (urls[index] as string).split(/[?#]/)[0]
+            );
+            const { cacheKey, fetchUrl, referrer } = resolveImage(
+              rawPath,
+              referrerQuery
+            );
+            const entry =
+              (await cacheManager.get(cacheKey)) ?? cacheManager.getCached(cacheKey);
+            const current = ensureFill(cacheKey, fetchUrl, referrer, entry);
+            if (current?.status === "ready") {
+              results[index] = { status: "ready", phase: "ready" };
+            } else if (current?.status === "error") {
+              results[index] = errorPayload(current);
+            } else {
+              results[index] = processingPayload(current);
+            }
+          } catch {
+            results[index] = {
+              status: "error",
+              phase: "failed",
+              errorStatusCode: 400,
+              message: "Invalid image URL",
+            };
+          }
+        }
+      })
+    );
+    res.json({ results });
   }
-  sendProcessing(res, cacheManager.getCached(cacheKey));
-});
+);
 
 app.get("/refresh/:imageUrl(*)", (req, res) => {
   const params = resolveRequestParams(req);
