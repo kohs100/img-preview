@@ -264,3 +264,101 @@ button.secondary {
 .download-cell[data-status="error"] .download-bar {
   background: #a11919;
 }
+
+.nav-link {
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.nav-link a {
+  color: var(--accent);
+}
+
+.route-toolbar {
+  margin-top: 18px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  font-size: 14px;
+}
+
+.route-table-wrap {
+  margin-top: 8px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.route-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.route-table th,
+.route-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.route-table th {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.route-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.route-table tr[data-active="false"] {
+  color: var(--muted);
+}
+
+.route-name {
+  font-weight: 700;
+}
+
+.route-detail {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.route-table .mono {
+  font-family: "IBM Plex Mono", "Fira Code", monospace;
+}
+
+.route-table .health-ok {
+  color: var(--accent);
+}
+
+.route-table .health-error {
+  color: #a11919;
+  white-space: normal;
+  min-width: 180px;
+}
+
+.route-table .use-active {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.concurrency-input {
+  width: 72px;
+  height: 30px;
+}
+
+button.small {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.page.wide {
+  max-width: 1400px;
+}

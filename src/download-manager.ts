@@ -1,4 +1,6 @@
 import sharp from "sharp";
+import { fetch, type Response } from "undici";
+import { type EgressPool, isProxyConnectError } from "./egress-pool";
 import type { ObjectStorage } from "./storage";
 
 export type ProcessingPhase =
@@ -58,24 +60,12 @@ function networkErrorCode(error: unknown): string | undefined {
 export class DownloadManager {
   private readonly storage: ObjectStorage;
 
-  private readonly originMinIntervalMs: number;
-
-  private readonly originQueue = new Map<string, Promise<void>>();
-
-  private readonly originNextAllowedAt = new Map<string, number>();
-
-  private readonly originActive = new Map<string, number>();
-
-  private readonly originWaiters = new Map<string, Array<() => void>>();
-
   constructor(
     storage: ObjectStorage,
-    originMinIntervalMs: number,
-    private readonly originMaxConcurrency = 8,
+    private readonly egress: EgressPool,
     private readonly originRetries = 2
   ) {
     this.storage = storage;
-    this.originMinIntervalMs = originMinIntervalMs;
   }
 
   async downloadAndProcess(
@@ -118,9 +108,10 @@ export class DownloadManager {
   }
 
   /**
-   * Downloads the body while holding one of the host's connection slots, so
-   * a burst of cache misses cannot open unbounded connections to one origin.
-   * Connection-level failures are retried with backoff outside the slot.
+   * Downloads the body while holding a slot on one egress route (direct or a
+   * proxy), so a burst of cache misses cannot open unbounded connections to
+   * one origin from any single IP. Connection-level failures are retried with
+   * backoff outside the slot, preferring a different route.
    */
   private async fetchFromOrigin(
     url: string,
@@ -128,11 +119,12 @@ export class DownloadManager {
     onProgress: (progress: ProcessingProgress) => void
   ): Promise<{ inputBuffer: Buffer; headerType: string }> {
     const host = new URL(url).host;
+    let lastRoute: string | undefined;
     for (let attempt = 1; ; attempt += 1) {
-      const release = await this.acquireOriginSlot(host);
+      const lease = await this.egress.acquire(host, lastRoute);
+      lastRoute = lease.routeId;
       try {
-        await this.throttleOriginRequest(url);
-        const res = await fetch(url, { referrer });
+        const res = await fetch(url, { referrer, dispatcher: lease.dispatcher });
         if (!res.ok) {
           throw new UpstreamHttpError(res.status, `Upstream fetch failed: ${res.status}`);
         }
@@ -140,52 +132,24 @@ export class DownloadManager {
         const totalBytes =
           Number.isFinite(totalHeader) && totalHeader >= 0 ? totalHeader : undefined;
         const inputBuffer = await this.readResponseBody(res, totalBytes, onProgress);
+        lease.release("ok", inputBuffer.length);
         return { inputBuffer, headerType: res.headers.get("content-type") || "" };
       } catch (error) {
         const code = networkErrorCode(error);
-        if (attempt > this.originRetries || !code || !TRANSIENT_NETWORK_CODES.has(code)) {
-          throw error;
-        }
+        const transient =
+          (code !== undefined && TRANSIENT_NETWORK_CODES.has(code)) ||
+          isProxyConnectError(error);
+        lease.release(transient ? "network-error" : "failed");
+        if (attempt > this.originRetries || !transient) throw error;
         // eslint-disable-next-line no-console
         console.warn(
-          `[${new Date().toISOString()}] origin-retry ${attempt}/${this.originRetries} ${code} ${url}`
+          `[${new Date().toISOString()}] origin-retry ${attempt}/${this.originRetries}` +
+            ` ${code ?? "PROXY"} via=${lease.routeId} ${url}`
         );
-      } finally {
-        release();
       }
       onProgress({ phase: "queued" });
       await this.sleep(1000 * 2 ** (attempt - 1));
     }
-  }
-
-  private async acquireOriginSlot(host: string): Promise<() => void> {
-    if (!(this.originMaxConcurrency > 0)) return () => undefined;
-    const active = this.originActive.get(host) ?? 0;
-    if (active < this.originMaxConcurrency) {
-      this.originActive.set(host, active + 1);
-    } else {
-      // The releasing download hands its slot over, so `active` is unchanged.
-      await new Promise<void>((resolve) => {
-        const waiters = this.originWaiters.get(host) ?? [];
-        waiters.push(resolve);
-        this.originWaiters.set(host, waiters);
-      });
-    }
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      const waiters = this.originWaiters.get(host);
-      const next = waiters?.shift();
-      if (waiters && waiters.length === 0) this.originWaiters.delete(host);
-      if (next) {
-        next();
-        return;
-      }
-      const remaining = (this.originActive.get(host) ?? 1) - 1;
-      if (remaining > 0) this.originActive.set(host, remaining);
-      else this.originActive.delete(host);
-    };
   }
 
   private async readResponseBody(
@@ -216,36 +180,6 @@ export class DownloadManager {
       onProgress({ phase: "downloading", completedBytes, totalBytes });
     }
     return Buffer.concat(chunks, completedBytes);
-  }
-
-  private async throttleOriginRequest(url: string): Promise<void> {
-    if (!Number.isFinite(this.originMinIntervalMs) || this.originMinIntervalMs <= 0) {
-      return;
-    }
-
-    const host = new URL(url).host;
-    const previous = this.originQueue.get(host) || Promise.resolve();
-    let release: () => void = () => undefined;
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.originQueue.set(host, previous.then(() => current));
-
-    await previous;
-    try {
-      const now = Date.now();
-      const nextAllowedAt = this.originNextAllowedAt.get(host) || 0;
-      const waitMs = Math.max(0, nextAllowedAt - now);
-      if (waitMs > 0) {
-        await this.sleep(waitMs);
-      }
-      this.originNextAllowedAt.set(host, Date.now() + this.originMinIntervalMs);
-    } finally {
-      release();
-      if (this.originQueue.get(host) === current) {
-        this.originQueue.delete(host);
-      }
-    }
   }
 
   private sleep(ms: number): Promise<void> {

@@ -2,6 +2,7 @@ import express from "express";
 import net from "net";
 import { type CacheEntry, CacheManager } from "./cache-manager";
 import { DownloadManager, UpstreamHttpError } from "./download-manager";
+import { egressPoolFromEnv } from "./egress-pool";
 import { backendConfigFromEnv, createStorage, EncryptedStorage } from "./storage";
 
 const app = express();
@@ -30,18 +31,72 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 const backendConfig = backendConfigFromEnv();
 const storage = createStorage(backendConfig);
 const cacheManager = new CacheManager(storage);
-const downloadManager = new DownloadManager(
-  storage,
-  originMinIntervalMs,
-  originMaxConcurrency,
-  originRetries
-);
+// Limits apply per egress route (direct and each proxy); 0 means effectively
+// unlimited, as before.
+const egressPool = egressPoolFromEnv({
+  defaultConcurrency: originMaxConcurrency > 0 ? originMaxConcurrency : 1000,
+  minIntervalMs: originMinIntervalMs,
+});
+const proxyCheckIntervalMs = process.env.PROXY_CHECK_INTERVAL_MS
+  ? Number(process.env.PROXY_CHECK_INTERVAL_MS)
+  : 10 * 60 * 1000;
+const downloadManager = new DownloadManager(storage, egressPool, originRetries);
 
 app.get("/", (_req, res) => {
   res.redirect("/static");
 });
 
 app.use("/static", express.static("public"));
+
+app.get("/api/proxies", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json(egressPool.snapshot());
+});
+
+/** Re-reads proxy.json, checks every route (or `ids`) and returns the state. */
+app.post("/api/proxies/check", express.json({ limit: "16kb" }), async (req, res) => {
+  const ids = (req.body as { ids?: unknown } | undefined)?.ids;
+  const checkIds =
+    Array.isArray(ids) && ids.every((id) => typeof id === "string")
+      ? (ids as string[])
+      : undefined;
+  if (!checkIds) egressPool.loadConfig();
+  await egressPool.check(checkIds);
+  res.setHeader("Cache-Control", "no-store");
+  res.json(egressPool.snapshot());
+});
+
+app.patch("/api/proxies/:id", express.json({ limit: "16kb" }), async (req, res) => {
+  const body = (req.body ?? {}) as { enabled?: unknown; concurrency?: unknown };
+  const patch: { enabled?: boolean; concurrency?: number } = {};
+  if (body.enabled !== undefined) {
+    if (typeof body.enabled !== "boolean") {
+      res.status(400).json({ error: "enabled must be a boolean" });
+      return;
+    }
+    patch.enabled = body.enabled;
+  }
+  if (body.concurrency !== undefined) {
+    if (!Number.isInteger(body.concurrency) || (body.concurrency as number) < 1) {
+      res.status(400).json({ error: "concurrency must be an integer >= 1" });
+      return;
+    }
+    patch.concurrency = body.concurrency as number;
+  }
+  try {
+    if (!(await egressPool.updateSettings(req.params.id, patch))) {
+      res.status(404).json({ error: "Unknown route" });
+      return;
+    }
+  } catch (error) {
+    res.status(500).json({
+      error: `Could not save settings: ${error instanceof Error ? error.message : error}`,
+    });
+    return;
+  }
+  res.setHeader("Cache-Control", "no-store");
+  res.json(egressPool.snapshot());
+});
 
 app.post("/api/submissions", express.json({ limit: "64kb" }), (req, res) => {
   const timestamp = new Date().toISOString();
@@ -353,6 +408,11 @@ async function startServer(): Promise<void> {
   // Unlike an ordinary index-listing failure, a bad encryption passphrase
   // must fail closed instead of starting a server that can never serve data.
   if (storage instanceof EncryptedStorage) await storage.ensureReady();
+  // Proxies join the pool as their checks pass; direct is usable meanwhile.
+  void egressPool.check();
+  if (proxyCheckIntervalMs > 0) {
+    setInterval(() => void egressPool.check(), proxyCheckIntervalMs).unref();
+  }
   app.listen(port, () => {
     // eslint-disable-next-line no-console
     console.log(

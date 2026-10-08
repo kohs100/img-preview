@@ -38,6 +38,9 @@ PNG는 WebP로 변환한 뒤 캐시에 저장합니다. 캐시는 **로컬 파�
 | `GET /refresh/:imageUrl(*)?referrer=` | 강제 재fetch 후 처리 상태 `503` JSON 반환 |
 | `POST /api/submissions`             | `204`; 프론트엔드 폼 제출을 로깅 |
 | `POST /api/cache-status`            | `{ urls, referrer }`(최대 500개)를 받아 캐시되지 않은 URL의 fetch를 시작하고, 입력 순서대로 `{ results: [{ status, phase, percent?, errorStatusCode?, message? }] }` 반환. 이미지 바이트는 보내지 않음 |
+| `GET /api/proxies`                  | 다운로드 경로(direct + 프록시)별 설정·health·외부 IP·사용 여부·통계 |
+| `POST /api/proxies/check`           | `proxy.json`을 다시 읽고 전체 경로를 검사한 뒤 상태 반환. `{ ids: [...] }`면 해당 경로만 검사 |
+| `PATCH /api/proxies/:id`            | `{ enabled?, concurrency? }` 변경 후 상태 반환. `proxy-settings.json`에 저장 |
 
 `:imageUrl`은 origin URL입니다. route가 `(*)` 와일드카드라 슬래시 포함 경로를 그대로
 받고, 서버의 `normalizeUrl`이 scheme이 없으면 `https://`를 보충합니다. 따라서
@@ -71,6 +74,34 @@ query/hash를 제거한 것이며, 스토리지 백엔드를 바꿔도 이 계�
 phase는 `queued`, `downloading`, `transforming`, `encrypting`, `uploading`, `indexing`
 순으로 진행됩니다. 브라우저 카드는 이후 S3 암호문 전송의 실제 byte 진행도와
 `decrypting` 상태도 별도로 표시합니다.
+
+## 다운로드 경로 (프록시)
+
+origin 다운로드는 서버 자체 연결(`direct`)과 `proxy.json`의 프록시들에 나눠 보냅니다.
+동시 다운로드 수 제한과 요청 간격은 **경로마다 따로** 적용되므로, 외부 IP가 다른 경로를
+추가할수록 IP 하나가 origin에 주는 부하는 그대로 두고 전체 병렬도만 늘어납니다.
+
+```json
+{
+  "tokyo": { "type": "SOCKS5", "hostname": "10.0.0.5", "port": 1080, "region": "jp", "auth": null },
+  "seoul": { "type": "SOCKS5", "hostname": "10.0.0.6", "port": 1080, "region": "kr",
+             "auth": { "id": "user", "password": "secret" } }
+}
+```
+
+- `type`은 `SOCKS5`, `SOCKS4`를 지원합니다. 목적지 DNS는 프록시에서 resolve됩니다.
+- 시작 시와 `PROXY_CHECK_INTERVAL_MS`마다 각 경로로 `PROXY_IP_CHECK_URL`을 요청해 동작
+  여부와 외부 IP를 확인합니다. 검사를 통과한 프록시만 사용하며, direct는 검사 결과와
+  무관하게 사용합니다.
+- 외부 IP가 같은 경로는 한 그룹으로 묶어 하나만 사용합니다(direct 우선, 그다음 지연시간이
+  짧은 순).
+- 다운로드 중 프록시 연결이 연속 3번 실패하면 그 프록시를 제외하고, 실패한 요청은 다른
+  경로로 재시도합니다. 다음 검사를 통과하면 다시 사용합니다.
+- `/static/proxies.html`(메인 페이지의 *Download routes*)에서 상태를 보고, 경로별
+  사용 여부와 동시 다운로드 수를 바꾸거나 `proxy.json`을 다시 읽어 재검사할 수 있습니다.
+  설정은 `proxy-settings.json`에 저장되고 `proxy.json`은 수정하지 않습니다.
+- 두 파일은 `.gitignore`에 포함되어 있습니다. 설정 API에는 인증이 없으므로 서버를 외부에
+  공개할 때는 앞단에서 접근을 제한해야 합니다.
 
 ## 스토리지 아키텍처
 
@@ -121,10 +152,15 @@ CORS 없이 동작합니다.
 | 변수                       | 기본값      | 설명 |
 | ------------------------- | ----------- | ---- |
 | `PORT`                    | `3013`      | HTTP 포트 |
-| `ORIGIN_MIN_INTERVAL_MS`  | `200`       | 동일 origin 호스트로의 요청 간 최소 간격 |
-| `ORIGIN_MAX_CONCURRENCY`  | `8`         | 동일 origin 호스트로 동시에 진행하는 다운로드 수. `0`이면 무제한 |
+| `ORIGIN_MIN_INTERVAL_MS`  | `200`       | 다운로드 경로별로 동일 origin 호스트에 보내는 요청 간 최소 간격 |
+| `ORIGIN_MAX_CONCURRENCY`  | `8`         | 다운로드 경로별 동일 origin 호스트 동시 다운로드 수 기본값(경로마다 설정 페이지에서 변경). `0`이면 사실상 무제한 |
 | `ORIGIN_RETRIES`          | `2`         | 연결 단계 오류(ETIMEDOUT, ECONNRESET 등) 재시도 횟수. 1s, 2s backoff. HTTP 에러 status는 재시도하지 않음 |
 | `ORIGIN_CONNECT_ATTEMPT_TIMEOUT_MS` | `2000` | 호스트가 여러 주소로 resolve될 때 주소 하나당 연결 시도 시간(Node 기본 250ms) |
+| `PROXY_CONFIG`            | `proxy.json` | 프록시 목록 파일 |
+| `PROXY_SETTINGS`          | `proxy-settings.json` | 경로별 enabled/concurrency 저장 파일 |
+| `PROXY_IP_CHECK_URL`      | `https://ifconfig.me/ip` | 외부 IP를 평문으로 돌려주는 health check URL |
+| `PROXY_CHECK_TIMEOUT_MS`  | `15000`     | 경로 하나의 health check 제한시간 |
+| `PROXY_CHECK_INTERVAL_MS` | `600000`    | 전체 경로 재검사 주기. `0`이면 시작 시 한 번만 |
 | `ERROR_RETRY_MS`          | `300000`    | 캐시된 origin 에러를 재시도 없이 그대로 반환하는 기간(ms). 이보다 오래된 에러는 다음 요청에서 origin 재시도. `0`이면 비활성화(에러 영구 캐시) |
 | `CACHE_BACKEND`           | `fs`        | `fs` 또는 `s3` |
 | `CACHE_DIR`               | `cache`     | `fs` 백엔드의 베이스 디렉터리 |
@@ -249,6 +285,7 @@ npm run migrate -- s3 fs
 ```
 src/
   server.ts            Express 앱 + 라우트 (프론트엔드 계약)
+  egress-pool.ts       다운로드 경로(direct + SOCKS 프록시), health check, 경로별 동시성
   cache-manager.ts     URL 기반 온디맨드 index + 메모리 hot cache
   download-manager.ts  origin fetch, 호스트별 throttle, PNG→WebP 변환
   migrate.ts           fs <-> s3 마이그레이션 CLI
@@ -261,5 +298,5 @@ src/
     crypto-format.ts   암호문 형식, 마스터키 봉투, PathCipher
     eme.ts             EME wide-block cipher (rfjakob/eme 호환)
     index.ts           배럴 익스포트
-public/                정적 프론트엔드 (index.html, script.js, style.css)
+public/                정적 프론트엔드 (index.html, script.js, proxies.html, proxies.js, style.css)
 ```

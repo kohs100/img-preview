@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Download Routes</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main class="page wide">
+      <p class="nav-link"><a href="/static/">&larr; Image preview</a></p>
+      <h1>Download Routes</h1>
+      <p>
+        Origin downloads are spread over the server's own connection
+        (<code>direct</code>) and the proxies in <code>proxy.json</code>. Each
+        route has its own per-origin concurrency limit. Proxies whose external
+        IP matches another route are grouped and only one of them is used.
+      </p>
+
+      <section class="route-toolbar">
+        <button type="button" id="checkAllButton">Reload proxy.json &amp; check all</button>
+        <span id="routeSummary"></span>
+      </section>
+      <div id="status"></div>
+
+      <div class="route-table-wrap">
+        <table class="route-table">
+          <thead>
+            <tr>
+              <th>Route</th>
+              <th>Endpoint</th>
+              <th>Health</th>
+              <th>External IP</th>
+              <th>Use</th>
+              <th>Enabled</th>
+              <th>Concurrency / host</th>
+              <th>In flight</th>
+              <th>Done / failed</th>
+              <th>Downloaded</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="routeRows"></tbody>
+        </table>
+      </div>
+    </main>
+    <script src="/static/proxies.js" defer></script>
+  </body>
+</html>

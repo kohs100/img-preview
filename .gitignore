@@ -3,3 +3,5 @@ cache/**
 .env
 dist/**
 node_modules/**
+proxy.json
+proxy-settings.json
