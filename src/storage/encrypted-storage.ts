@@ -1,5 +1,5 @@
 import { randomBytes } from "crypto";
-import type { ObjectStorage } from "./types";
+import type { ObjectStorage, RedirectEndpoint } from "./types";
 import {
   decryptObject,
   ENCRYPTED_PATH_PREFIX,
@@ -109,9 +109,16 @@ export class EncryptedStorage implements ObjectStorage {
     await this.inner.delete(this.physicalKey(key));
   }
 
-  async getRedirectUrl(key: string): Promise<string | null> {
+  async getRedirectUrl(
+    key: string,
+    endpoint?: RedirectEndpoint
+  ): Promise<string | null> {
     await this.ready;
-    return this.inner.getRedirectUrl?.(this.physicalKey(key)) ?? null;
+    return this.inner.getRedirectUrl?.(this.physicalKey(key), endpoint) ?? null;
+  }
+
+  redirectEndpoints(): Record<RedirectEndpoint, string> | null {
+    return this.inner.redirectEndpoints?.() ?? null;
   }
 
   /** Return the authenticated ciphertext container without decrypting it. */

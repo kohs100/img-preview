@@ -42,8 +42,21 @@ export interface ObjectStorage {
    * not configured to) return `null`, in which case the server streams the
    * bytes itself.
    */
-  getRedirectUrl?(key: string): Promise<string | null>;
+  getRedirectUrl?(key: string, endpoint?: RedirectEndpoint): Promise<string | null>;
+
+  /**
+   * Optional. The endpoints a client may pick for redirect URLs, or null when
+   * there is no choice (no presigning, or both endpoints are the same).
+   */
+  redirectEndpoints?(): Record<RedirectEndpoint, string> | null;
 }
+
+/**
+ * Which endpoint a presigned redirect URL points at: `browser` is
+ * S3_BROWSER_ENDPOINT (e.g. a CDN in front of the store), `direct` is
+ * S3_ENDPOINT, the address the server itself uses.
+ */
+export type RedirectEndpoint = "browser" | "direct";
 
 export type FsBackendConfig = {
   kind: "fs";

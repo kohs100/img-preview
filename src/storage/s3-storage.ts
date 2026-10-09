@@ -7,7 +7,7 @@ import {
   S3Client,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import type { ObjectStorage, S3BackendConfig } from "./types";
+import type { ObjectStorage, RedirectEndpoint, S3BackendConfig } from "./types";
 
 /**
  * S3-compatible object storage. Works with AWS S3 as well as MinIO,
@@ -21,6 +21,8 @@ export class S3Storage implements ObjectStorage {
   private readonly client: S3Client;
 
   private readonly browserClient: S3Client;
+
+  private readonly endpoints: Record<RedirectEndpoint, string> | null;
 
   private readonly bucket: string;
 
@@ -57,6 +59,13 @@ export class S3Storage implements ObjectStorage {
       ...clientOptions,
       endpoint: config.endpoint,
     });
+    this.endpoints =
+      config.presign &&
+      config.endpoint &&
+      config.browserEndpoint &&
+      config.browserEndpoint !== config.endpoint
+        ? { browser: config.browserEndpoint, direct: config.endpoint }
+        : null;
     this.browserClient = new S3Client({
       ...clientOptions,
       endpoint: config.browserEndpoint ?? config.endpoint,
@@ -146,7 +155,14 @@ export class S3Storage implements ObjectStorage {
     );
   }
 
-  async getRedirectUrl(key: string): Promise<string | null> {
+  redirectEndpoints(): Record<RedirectEndpoint, string> | null {
+    return this.endpoints;
+  }
+
+  async getRedirectUrl(
+    key: string,
+    endpoint: RedirectEndpoint = "browser"
+  ): Promise<string | null> {
     const objectKey = this.toObjectKey(key);
     if (this.publicUrlBase && !this.presign) {
       const encodedPath = objectKey
@@ -157,7 +173,7 @@ export class S3Storage implements ObjectStorage {
     }
     if (this.presign) {
       return getSignedUrl(
-        this.browserClient,
+        endpoint === "direct" ? this.client : this.browserClient,
         new GetObjectCommand({ Bucket: this.bucket, Key: objectKey }),
         { expiresIn: this.presignExpires }
       );

@@ -48,6 +48,22 @@ app.get("/", (_req, res) => {
 
 app.use("/static", express.static("public"));
 
+/** Endpoints the frontend may choose for presigned image URLs. */
+app.get("/api/storage/endpoints", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const endpoints = storage.redirectEndpoints?.() ?? null;
+  res.json({
+    selectable: endpoints !== null,
+    default: "browser",
+    options: endpoints
+      ? (["browser", "direct"] as const).map((id) => ({
+          id,
+          origin: new URL(endpoints[id]).origin,
+        }))
+      : [],
+  });
+});
+
 app.get("/api/proxies", (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.json(egressPool.snapshot());
@@ -275,7 +291,10 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
     let redirectUrl: string | null = null;
     if (storage.getRedirectUrl) {
       try {
-        redirectUrl = await storage.getRedirectUrl(entry.key);
+        redirectUrl = await storage.getRedirectUrl(
+          entry.key,
+          firstQueryValue(req.query.endpoint) === "direct" ? "direct" : "browser"
+        );
       } catch {
         redirectUrl = null;
       }

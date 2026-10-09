@@ -39,6 +39,7 @@ PNG는 WebP로 변환한 뒤 캐시에 저장합니다. 캐시는 **로컬 파�
 | `POST /api/submissions`             | `204`; 프론트엔드 폼 제출을 로깅 |
 | `POST /api/cache-status`            | `{ urls, referrer }`(최대 500개)를 받아 캐시되지 않은 URL의 fetch를 시작하고, 입력 순서대로 `{ results: [{ status, phase, percent?, errorStatusCode?, message? }] }` 반환. 이미지 바이트는 보내지 않음 |
 | `GET /api/proxies`                  | 다운로드 경로(direct + 프록시)별 설정·health·외부 IP·사용 여부·통계 |
+| `GET /api/storage/endpoints`        | presigned URL에 쓸 수 있는 endpoint 목록(`browser` = `S3_BROWSER_ENDPOINT`, `direct` = `S3_ENDPOINT`)과 선택 가능 여부 |
 | `POST /api/proxies/check`           | `proxy.json`을 다시 읽고 전체 경로를 검사한 뒤 상태 반환. `{ ids: [...] }`면 해당 경로만 검사 |
 | `PATCH /api/proxies/:id`            | `{ enabled?, concurrency? }` 변경 후 상태 반환. `proxy-settings.json`에 저장 |
 
@@ -169,7 +170,7 @@ CORS 없이 동작합니다.
 | `S3_BUCKET`               | —           | 버킷 이름 (`s3`에서 필수) |
 | `S3_REGION`               | `us-east-1` | 리전 |
 | `S3_ENDPOINT`             | —           | S3 호환 서버의 커스텀 엔드포인트 (예: `http://localhost:9000`) |
-| `S3_BROWSER_ENDPOINT`     | `S3_ENDPOINT` | 브라우저용 presigned URL에 넣을 HTTPS endpoint. 서버 내부 endpoint와 분리 가능 |
+| `S3_BROWSER_ENDPOINT`     | `S3_ENDPOINT` | 브라우저용 presigned URL에 넣을 HTTPS endpoint(예: CDN). `S3_ENDPOINT`와 다르면 메인 페이지의 *Image endpoint*에서 브라우저별로 CDN/Direct를 고를 수 있음(선택은 localStorage에 저장, https 페이지에서는 http endpoint 비활성) |
 | `S3_ACCESS_KEY_ID`        | —           | 미설정 시 기본 AWS 자격증명 체인 사용 |
 | `S3_SECRET_ACCESS_KEY`    | —           | — |
 | `S3_FORCE_PATH_STYLE`     | `true`      | path-style 주소 방식 (대부분의 비-AWS 서버에 필요) |

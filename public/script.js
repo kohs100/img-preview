@@ -4,6 +4,8 @@ const clothesInput = document.getElementById("clothesInput");
 const typeInput = document.getElementById("typeInput");
 const templateInput = document.getElementById("templateInput");
 const referrerSelect = document.getElementById("referrerSelect");
+const endpointLabel = document.getElementById("endpointLabel");
+const endpointSelect = document.getElementById("endpointSelect");
 const statusEl = document.getElementById("status");
 const modeLabelEl = document.getElementById("modeLabel");
 const listEl = document.getElementById("list");
@@ -30,6 +32,8 @@ let downloadSession = 0;
 const MAX_POLL_RETRY = 60;
 const textEncoder = new TextEncoder();
 const PASSPHRASE_STORAGE_KEY = "img-preview.cache-passphrase.v1";
+// Per browser: whether this viewer can reach S3_ENDPOINT depends on its network.
+const ENDPOINT_STORAGE_KEY = "img-preview.image-endpoint.v1";
 let encryptionConfigPromise = null;
 let masterKeyPromise = null;
 let pendingUnlockResolve = null;
@@ -273,10 +277,60 @@ function selectedReferrer() {
   return referrerSelect.value || "babechat.ai";
 }
 
+/**
+ * Offers S3_BROWSER_ENDPOINT (e.g. the CDN) vs S3_ENDPOINT for presigned image
+ * URLs when the server presigns with two different endpoints. A plain-http
+ * endpoint cannot be fetched from an https page, so it is disabled there.
+ */
+async function loadEndpointOptions() {
+  let config;
+  try {
+    const response = await fetch("/api/storage/endpoints", { cache: "no-store" });
+    if (!response.ok) return;
+    config = await response.json();
+  } catch {
+    return;
+  }
+  if (!config.selectable) return;
+
+  const labels = { browser: "CDN", direct: "Direct" };
+  endpointSelect.replaceChildren(
+    ...config.options.map((option) => {
+      const element = document.createElement("option");
+      element.value = option.id;
+      const blocked =
+        location.protocol === "https:" && option.origin.startsWith("http:");
+      element.disabled = blocked;
+      element.textContent =
+        `${labels[option.id] || option.id} (${new URL(option.origin).host})` +
+        (blocked ? " - blocked on https page" : "");
+      return element;
+    })
+  );
+  let saved = null;
+  try {
+    saved = localStorage.getItem(ENDPOINT_STORAGE_KEY);
+  } catch {
+    // Storage may be unavailable; fall back to the default.
+  }
+  const usable = Array.from(endpointSelect.options).filter((option) => !option.disabled);
+  const choice =
+    usable.find((option) => option.value === saved) ||
+    usable.find((option) => option.value === config.default) ||
+    usable[0];
+  if (choice) endpointSelect.value = choice.value;
+  endpointLabel.hidden = false;
+}
+
+function selectedEndpoint() {
+  return endpointLabel.hidden ? "" : endpointSelect.value;
+}
+
 function toCachedUrl(originUrl) {
   const params = new URLSearchParams({
     referrer: selectedReferrer(),
   });
+  if (selectedEndpoint() === "direct") params.set("endpoint", "direct");
   // The /cached/:imageUrl(*) route captures the rest of the path verbatim, and
   // the server re-adds the https:// scheme, so we can drop the scheme and skip
   // encoding for clean CDN URLs (alphanumerics, "/", ".", "_", "$", ...).
@@ -855,6 +909,20 @@ backButton.addEventListener("click", () => {
   renderMainList();
 });
 
+endpointSelect.addEventListener("change", () => {
+  try {
+    localStorage.setItem(ENDPOINT_STORAGE_KEY, endpointSelect.value);
+  } catch {
+    // The choice still applies to this page.
+  }
+  if (!state) return;
+  // Reload the visible images through the newly chosen endpoint.
+  if (currentView.mode === "main") renderMainList();
+  else if (currentView.mode === "type") {
+    renderTypeList(currentView.characterIndex, currentView.clothesIndex);
+  }
+});
+
 downloadAllButton.addEventListener("click", () => {
   if (!state) return;
   setStatus("");
@@ -961,7 +1029,8 @@ function hydrateFromQuery() {
   );
 }
 
-hydrateFromQuery();
+// Restored images should already use the remembered endpoint.
+void loadEndpointOptions().finally(hydrateFromQuery);
 void encryptionConfig().catch(() => {
   encryptionPanel.hidden = false;
   updateEncryptionStatus("Could not load encryption configuration.", true);
