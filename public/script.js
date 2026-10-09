@@ -27,12 +27,20 @@ let currentView = {
 const POLL_INTERVAL_MS = 1200;
 const DOWNLOAD_POLL_INTERVAL_MS = 1500;
 const DOWNLOAD_BATCH_SIZE = 200;
-// Bumped whenever the list is replaced so a running download poll stops.
+// Bumped whenever the list is replaced so running polls and image loads stop.
 let downloadSession = 0;
 const MAX_POLL_RETRY = 60;
+// Image downloads (the /cached request plus the storage/CDN request) in
+// flight at once across the page; more queue up instead of opening a burst
+// of connections the storage proxy may reset.
+const IMAGE_FETCH_CONCURRENCY = 6;
+// Storage connection failures retried per image, with exponential backoff.
+const MAX_STORAGE_RETRIES = 5;
+// Cards start loading when they come this close to the viewport.
+const CARD_PRELOAD_MARGIN = "600px";
 const textEncoder = new TextEncoder();
 const PASSPHRASE_STORAGE_KEY = "img-preview.cache-passphrase.v1";
-// Per browser: whether this viewer can reach S3_ENDPOINT depends on its network.
+// Per browser: which endpoint is reachable or fastest depends on the viewer.
 const ENDPOINT_STORAGE_KEY = "img-preview.image-endpoint.v1";
 let encryptionConfigPromise = null;
 let masterKeyPromise = null;
@@ -281,10 +289,9 @@ function selectedReferrer() {
 let defaultEndpoint = null;
 
 /**
- * Offers every S3_BROWSER_ENDPOINT entry (e.g. CDNs) and S3_ENDPOINT
- * ("Direct") for presigned image URLs when the server has more than one. A
- * plain-http endpoint cannot be fetched from an https page, so it is disabled
- * there.
+ * Offers the S3_BROWSER_ENDPOINT entries (e.g. CDNs) for presigned image URLs
+ * when the server has more than one. A plain-http endpoint cannot be fetched
+ * from an https page, so it is disabled there.
  */
 async function loadEndpointOptions() {
   let config;
@@ -442,85 +449,192 @@ async function readResponseBuffer(response, onProgress) {
   return joined.buffer;
 }
 
-async function setImagePolling(img, cachedUrl, onProgress) {
-  const config = await encryptionConfig();
-  onProgress({ phase: "queued" });
-  for (let retryCount = 0; retryCount <= MAX_POLL_RETRY; retryCount += 1) {
-    let response;
+function createLimiter(limit) {
+  let active = 0;
+  const queue = [];
+  return async function acquire() {
+    if (active < limit) active += 1;
+    else await new Promise((resolve) => queue.push(resolve));
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = queue.shift();
+      // A queued caller inherits the slot, so `active` stays the same.
+      if (next) next();
+      else active -= 1;
+    };
+  };
+}
+
+const acquireImageFetchSlot = createLimiter(IMAGE_FETCH_CONCURRENCY);
+
+class StorageFetchError extends Error {}
+
+/**
+ * One /cached request and, when the image is ready, the download of its
+ * bytes (from storage/CDN when the server hands out a presigned URL).
+ * Returns { payload, contentType }, { pending: true } or { failed }; storage
+ * connection failures and non-OK storage responses throw StorageFetchError.
+ */
+async function fetchImageAttempt(cachedUrl, config, onProgress) {
+  let response;
+  try {
+    response = await fetch(cachedUrl, { cache: "no-store" });
+  } catch {
+    onProgress({ phase: "queued" });
+    return { pending: true };
+  }
+
+  if (response.status === 200) {
+    let bodyResponse = response;
+    let contentType = config.enabled
+      ? response.headers.get("X-Image-Content-Type") || ""
+      : response.headers.get("content-type") || "";
+    if (
+      config.enabled &&
+      (response.headers.get("content-type") || "").includes("application/json")
+    ) {
+      const descriptor = await response.json();
+      if (!descriptor.encrypted || !descriptor.url) {
+        throw new Error("Invalid encrypted image descriptor");
+      }
+      contentType = descriptor.contentType || "";
+      try {
+        bodyResponse = await fetch(descriptor.url, { cache: "no-store" });
+      } catch (error) {
+        throw new StorageFetchError(error instanceof Error ? error.message : String(error));
+      }
+      if (!bodyResponse.ok) {
+        throw new StorageFetchError(`storage returned HTTP ${bodyResponse.status}`);
+      }
+    }
     try {
-      response = await fetch(cachedUrl, { cache: "no-store" });
+      return { payload: await readResponseBuffer(bodyResponse, onProgress), contentType };
+    } catch (error) {
+      throw new StorageFetchError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  if (response.status === 503) {
+    try {
+      const progress = await response.json();
+      if (progress?.status === "processing") onProgress(progress);
     } catch {
-      response = null;
+      onProgress({ phase: "queued" });
+    }
+    return { pending: true };
+  }
+
+  let errorStatusCode = response.status;
+  let message = `Request failed with HTTP ${response.status}`;
+  try {
+    if ((response.headers.get("content-type") || "").includes("application/json")) {
+      const payload = await response.json();
+      errorStatusCode = payload.errorStatusCode ?? response.status;
+      message = payload.message || message;
+    } else {
+      message = (await response.text()) || message;
+    }
+  } catch {
+    // Keep the HTTP fallback message.
+  }
+  return { failed: { phase: "failed", errorStatusCode, message } };
+}
+
+/**
+ * Loads one card's image. Each attempt holds a page-wide download slot; the
+ * slot is released before decryption (which may wait for the passphrase)
+ * and before sleeping. Stops once the list it belongs to is replaced.
+ */
+async function setImagePolling(img, cachedUrl, onProgress, generation) {
+  const config = await encryptionConfig();
+  const isStale = () => generation !== downloadSession;
+  onProgress({ phase: "queued" });
+  let storageFailures = 0;
+  for (let retryCount = 0; retryCount <= MAX_POLL_RETRY; retryCount += 1) {
+    const release = await acquireImageFetchSlot();
+    if (isStale()) {
+      release();
+      return null;
+    }
+    let result;
+    try {
+      result = await fetchImageAttempt(cachedUrl, config, onProgress);
+    } catch (error) {
+      if (!(error instanceof StorageFetchError)) throw error;
+      result = { storageError: error.message };
+    } finally {
+      release();
     }
 
-    if (response && response.status === 200) {
-      let blob;
+    if (result.payload) {
+      let bytes = result.payload;
       if (config.enabled) {
-        let encryptedResponse = response;
-        let contentType = response.headers.get("X-Image-Content-Type") || "";
-        if ((response.headers.get("content-type") || "").includes("application/json")) {
-          const descriptor = await response.json();
-          if (!descriptor.encrypted || !descriptor.url) {
-            throw new Error("Invalid encrypted image descriptor");
-          }
-          contentType = descriptor.contentType || "";
-          encryptedResponse = await fetch(descriptor.url, { cache: "no-store" });
-          if (!encryptedResponse.ok) throw new Error("Encrypted image download failed");
-        }
-        const encryptedPayload = await readResponseBuffer(
-          encryptedResponse,
-          onProgress
-        );
         onProgress({ phase: "decrypting" });
-        const plaintext = await decryptImagePayload(
-          encryptedPayload
-        );
-        blob = new Blob([plaintext], { type: contentType });
-      } else {
-        const contentType = response.headers.get("content-type") || "";
-        const plaintext = await readResponseBuffer(response, onProgress);
-        blob = new Blob([plaintext], { type: contentType });
+        bytes = await decryptImagePayload(result.payload);
       }
-      const objectUrl = URL.createObjectURL(blob);
+      const objectUrl = URL.createObjectURL(new Blob([bytes], { type: result.contentType }));
       img.src = objectUrl;
       onProgress({ phase: "ready", percent: 100 });
       return objectUrl;
     }
-
-    if (response?.status === 503) {
-      try {
-        const progress = await response.json();
-        if (progress?.status === "processing") onProgress(progress);
-      } catch {
-        onProgress({ phase: "queued" });
-      }
-    } else if (!response) {
-      onProgress({ phase: "queued" });
-    } else {
-      let errorStatusCode = response.status;
-      let message = `Request failed with HTTP ${response.status}`;
-      try {
-        if ((response.headers.get("content-type") || "").includes("application/json")) {
-          const payload = await response.json();
-          errorStatusCode = payload.errorStatusCode ?? response.status;
-          message = payload.message || message;
-        } else {
-          message = (await response.text()) || message;
-        }
-      } catch {
-        // Keep the HTTP fallback message.
-      }
-      onProgress({ phase: "failed", errorStatusCode, message });
+    if (result.failed) {
+      onProgress(result.failed);
       return null;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    let delayMs = POLL_INTERVAL_MS;
+    if (result.storageError) {
+      storageFailures += 1;
+      if (storageFailures > MAX_STORAGE_RETRIES) {
+        onProgress({
+          phase: "failed",
+          message: `Storage download failed: ${result.storageError}`,
+        });
+        return null;
+      }
+      // Retrying /cached also yields a fresh presigned URL.
+      delayMs = Math.min(1000 * 2 ** (storageFailures - 1), 16000);
+      onProgress({ phase: "queued" });
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    if (isStale()) return null;
   }
   return null;
 }
 
+// Starts each card's download when it nears the viewport, so a long list
+// does not request every image at once.
+const cardStarters = new WeakMap();
+const cardObserver =
+  typeof IntersectionObserver === "function"
+    ? new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            const start = cardStarters.get(entry.target);
+            cardStarters.delete(entry.target);
+            cardObserver.unobserve(entry.target);
+            if (start) start();
+          }
+        },
+        { rootMargin: CARD_PRELOAD_MARGIN }
+      )
+    : null;
+
+function startWhenVisible(element, start) {
+  if (!cardObserver) {
+    start();
+    return;
+  }
+  cardStarters.set(element, start);
+  cardObserver.observe(element);
+}
+
 function clearList() {
   downloadSession += 1;
+  cardObserver?.disconnect();
   listEl.innerHTML = "";
   listEl.classList.remove("download-grid");
 }
@@ -604,18 +718,21 @@ function makeCard({ src, label, onClick, openImage = false }) {
     loadStatus.hidden = progress.phase === "ready";
     loadStatus.classList.toggle("error", progress.phase === "failed");
   };
-  void setImagePolling(img, src, onProgress).then((objectUrl) => {
-    if (
-      openImage &&
-      objectUrl &&
-      mediaWrapper instanceof HTMLAnchorElement
-    ) {
-      mediaWrapper.href = objectUrl;
-    }
-  }).catch((error) => {
-    img.alt = error instanceof Error ? error.message : "Image decryption failed";
-    loadStatus.textContent = "Failed";
-    loadStatus.classList.add("error");
+  const generation = downloadSession;
+  startWhenVisible(card, () => {
+    void setImagePolling(img, src, onProgress, generation).then((objectUrl) => {
+      if (
+        openImage &&
+        objectUrl &&
+        mediaWrapper instanceof HTMLAnchorElement
+      ) {
+        mediaWrapper.href = objectUrl;
+      }
+    }).catch((error) => {
+      img.alt = error instanceof Error ? error.message : "Image decryption failed";
+      loadStatus.textContent = "Failed";
+      loadStatus.classList.add("error");
+    });
   });
   img.alt = label;
 
