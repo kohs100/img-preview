@@ -277,10 +277,14 @@ function selectedReferrer() {
   return referrerSelect.value || "babechat.ai";
 }
 
+// Endpoint the server uses when /cached gets no `endpoint` parameter.
+let defaultEndpoint = null;
+
 /**
- * Offers S3_BROWSER_ENDPOINT (e.g. the CDN) vs S3_ENDPOINT for presigned image
- * URLs when the server presigns with two different endpoints. A plain-http
- * endpoint cannot be fetched from an https page, so it is disabled there.
+ * Offers every S3_BROWSER_ENDPOINT entry (e.g. CDNs) and S3_ENDPOINT
+ * ("Direct") for presigned image URLs when the server has more than one. A
+ * plain-http endpoint cannot be fetched from an https page, so it is disabled
+ * there.
  */
 async function loadEndpointOptions() {
   let config;
@@ -293,7 +297,7 @@ async function loadEndpointOptions() {
   }
   if (!config.selectable) return;
 
-  const labels = { browser: "CDN", direct: "Direct" };
+  defaultEndpoint = config.default;
   endpointSelect.replaceChildren(
     ...config.options.map((option) => {
       const element = document.createElement("option");
@@ -302,7 +306,7 @@ async function loadEndpointOptions() {
         location.protocol === "https:" && option.origin.startsWith("http:");
       element.disabled = blocked;
       element.textContent =
-        `${labels[option.id] || option.id} (${new URL(option.origin).host})` +
+        `${option.label} (${new URL(option.origin).host})` +
         (blocked ? " - blocked on https page" : "");
       return element;
     })
@@ -330,7 +334,8 @@ function toCachedUrl(originUrl) {
   const params = new URLSearchParams({
     referrer: selectedReferrer(),
   });
-  if (selectedEndpoint() === "direct") params.set("endpoint", "direct");
+  const endpoint = selectedEndpoint();
+  if (endpoint && endpoint !== defaultEndpoint) params.set("endpoint", endpoint);
   // The /cached/:imageUrl(*) route captures the rest of the path verbatim, and
   // the server re-adds the https:// scheme, so we can drop the scheme and skip
   // encoding for clean CDN URLs (alphanumerics, "/", ".", "_", "$", ...).

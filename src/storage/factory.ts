@@ -3,11 +3,33 @@ import path from "path";
 import { FsStorage } from "./fs-storage";
 import { S3Storage } from "./s3-storage";
 import { EncryptedStorage } from "./encrypted-storage";
-import type { BackendConfig, ObjectStorage } from "./types";
+import type { BackendConfig, BrowserEndpoint, ObjectStorage } from "./types";
 
 function envBool(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined) return fallback;
   return /^(1|true|yes|on)$/i.test(value.trim());
+}
+
+/**
+ * Parses S3_BROWSER_ENDPOINT: a comma-separated list of `url` or `name=url`
+ * entries. Names become the ids clients pick; `direct` is reserved.
+ */
+export function parseBrowserEndpoints(raw: string | undefined): BrowserEndpoint[] {
+  const entries: BrowserEndpoint[] = [];
+  for (const part of (raw ?? "").split(",").map((item) => item.trim()).filter(Boolean)) {
+    const named = part.match(/^([A-Za-z0-9_-]+)=(.+)$/);
+    const entry = named ? { name: named[1], url: named[2].trim() } : { url: part };
+    try {
+      new URL(entry.url);
+    } catch {
+      throw new Error(`S3_BROWSER_ENDPOINT has an invalid URL: ${entry.url}`);
+    }
+    if (entry.name === "direct") {
+      throw new Error("S3_BROWSER_ENDPOINT name 'direct' is reserved for S3_ENDPOINT");
+    }
+    entries.push(entry);
+  }
+  return entries;
 }
 
 /**
@@ -38,7 +60,7 @@ export function backendConfigFromEnv(
     bucket,
     region: process.env.S3_REGION || "us-east-1",
     endpoint: process.env.S3_ENDPOINT || undefined,
-    browserEndpoint: process.env.S3_BROWSER_ENDPOINT || undefined,
+    browserEndpoints: parseBrowserEndpoints(process.env.S3_BROWSER_ENDPOINT),
     accessKeyId: process.env.S3_ACCESS_KEY_ID || undefined,
     secretAccessKey: process.env.S3_SECRET_ACCESS_KEY || undefined,
     forcePathStyle: envBool(process.env.S3_FORCE_PATH_STYLE, true),

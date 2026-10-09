@@ -7,7 +7,13 @@ import {
   S3Client,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import type { ObjectStorage, RedirectEndpoint, S3BackendConfig } from "./types";
+import type { ObjectStorage, RedirectEndpoints, S3BackendConfig } from "./types";
+
+type PresignTarget = { id: string; label: string; url: string; client: S3Client };
+
+function sameUrl(a: string, b: string): boolean {
+  return new URL(a).href === new URL(b).href;
+}
 
 /**
  * S3-compatible object storage. Works with AWS S3 as well as MinIO,
@@ -20,9 +26,8 @@ export class S3Storage implements ObjectStorage {
 
   private readonly client: S3Client;
 
-  private readonly browserClient: S3Client;
-
-  private readonly endpoints: Record<RedirectEndpoint, string> | null;
+  /** Clients for presigned URLs; the first one is the default. */
+  private readonly presignTargets: PresignTarget[];
 
   private readonly bucket: string;
 
@@ -59,17 +64,34 @@ export class S3Storage implements ObjectStorage {
       ...clientOptions,
       endpoint: config.endpoint,
     });
-    this.endpoints =
-      config.presign &&
-      config.endpoint &&
-      config.browserEndpoint &&
-      config.browserEndpoint !== config.endpoint
-        ? { browser: config.browserEndpoint, direct: config.endpoint }
-        : null;
-    this.browserClient = new S3Client({
-      ...clientOptions,
-      endpoint: config.browserEndpoint ?? config.endpoint,
-    });
+    // Browser endpoints first (unnamed ones are browser, browser2, ...), then
+    // S3_ENDPOINT as `direct` unless a browser entry already points there.
+    const browser = config.browserEndpoints;
+    this.presignTargets = browser.map((entry, index) => ({
+      id: entry.name ?? (index === 0 ? "browser" : `browser${index + 1}`),
+      label: entry.name ?? (browser.length > 1 ? `Browser ${index + 1}` : "Browser"),
+      url: entry.url,
+      client:
+        config.endpoint && sameUrl(entry.url, config.endpoint)
+          ? this.client
+          : new S3Client({ ...clientOptions, endpoint: entry.url }),
+    }));
+    if (
+      this.presignTargets.length === 0 ||
+      (config.endpoint && !browser.some((entry) => sameUrl(entry.url, config.endpoint!)))
+    ) {
+      this.presignTargets.push({
+        id: "direct",
+        label: "Direct",
+        url: config.endpoint ?? "",
+        client: this.client,
+      });
+    }
+    const ids = this.presignTargets.map((target) => target.id);
+    const duplicate = ids.find((id, index) => ids.indexOf(id) !== index);
+    if (duplicate) {
+      throw new Error(`S3_BROWSER_ENDPOINT has a duplicate endpoint id: ${duplicate}`);
+    }
   }
 
   private toObjectKey(key: string): string {
@@ -155,14 +177,15 @@ export class S3Storage implements ObjectStorage {
     );
   }
 
-  redirectEndpoints(): Record<RedirectEndpoint, string> | null {
-    return this.endpoints;
+  redirectEndpoints(): RedirectEndpoints | null {
+    if (!this.presign || this.presignTargets.length < 2) return null;
+    return {
+      default: this.presignTargets[0].id,
+      options: this.presignTargets.map(({ id, label, url }) => ({ id, label, url })),
+    };
   }
 
-  async getRedirectUrl(
-    key: string,
-    endpoint: RedirectEndpoint = "browser"
-  ): Promise<string | null> {
+  async getRedirectUrl(key: string, endpointId?: string): Promise<string | null> {
     const objectKey = this.toObjectKey(key);
     if (this.publicUrlBase && !this.presign) {
       const encodedPath = objectKey
@@ -172,8 +195,11 @@ export class S3Storage implements ObjectStorage {
       return `${this.publicUrlBase}/${encodedPath}`;
     }
     if (this.presign) {
+      const target =
+        this.presignTargets.find((item) => item.id === endpointId) ??
+        this.presignTargets[0];
       return getSignedUrl(
-        endpoint === "direct" ? this.client : this.browserClient,
+        target.client,
         new GetObjectCommand({ Bucket: this.bucket, Key: objectKey }),
         { expiresIn: this.presignExpires }
       );

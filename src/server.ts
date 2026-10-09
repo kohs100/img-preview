@@ -54,13 +54,12 @@ app.get("/api/storage/endpoints", (_req, res) => {
   const endpoints = storage.redirectEndpoints?.() ?? null;
   res.json({
     selectable: endpoints !== null,
-    default: "browser",
-    options: endpoints
-      ? (["browser", "direct"] as const).map((id) => ({
-          id,
-          origin: new URL(endpoints[id]).origin,
-        }))
-      : [],
+    default: endpoints?.default ?? null,
+    options: (endpoints?.options ?? []).map(({ id, label, url }) => ({
+      id,
+      label,
+      origin: new URL(url).origin,
+    })),
   });
 });
 
@@ -293,7 +292,7 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
       try {
         redirectUrl = await storage.getRedirectUrl(
           entry.key,
-          firstQueryValue(req.query.endpoint) === "direct" ? "direct" : "browser"
+          firstQueryValue(req.query.endpoint) || undefined
         );
       } catch {
         redirectUrl = null;

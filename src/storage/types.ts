@@ -42,21 +42,27 @@ export interface ObjectStorage {
    * not configured to) return `null`, in which case the server streams the
    * bytes itself.
    */
-  getRedirectUrl?(key: string, endpoint?: RedirectEndpoint): Promise<string | null>;
+  getRedirectUrl?(key: string, endpointId?: string): Promise<string | null>;
 
   /**
    * Optional. The endpoints a client may pick for redirect URLs, or null when
-   * there is no choice (no presigning, or both endpoints are the same).
+   * there is no choice (no presigning, or only one distinct endpoint).
    */
-  redirectEndpoints?(): Record<RedirectEndpoint, string> | null;
+  redirectEndpoints?(): RedirectEndpoints | null;
 }
 
 /**
- * Which endpoint a presigned redirect URL points at: `browser` is
- * S3_BROWSER_ENDPOINT (e.g. a CDN in front of the store), `direct` is
- * S3_ENDPOINT, the address the server itself uses.
+ * Endpoints a presigned redirect URL can point at: every S3_BROWSER_ENDPOINT
+ * entry (e.g. a CDN in front of the store) and `direct`, the S3_ENDPOINT the
+ * server itself uses. Unknown ids fall back to `default`.
  */
-export type RedirectEndpoint = "browser" | "direct";
+export type RedirectEndpoints = {
+  default: string;
+  options: { id: string; label: string; url: string }[];
+};
+
+/** One S3_BROWSER_ENDPOINT entry: `url` or `name=url`. */
+export type BrowserEndpoint = { name?: string; url: string };
 
 export type FsBackendConfig = {
   kind: "fs";
@@ -69,8 +75,11 @@ export type S3BackendConfig = {
   region: string;
   /** Custom endpoint for S3-compatible services (MinIO, R2, etc.). */
   endpoint?: string;
-  /** HTTPS endpoint embedded in browser-facing presigned URLs. */
-  browserEndpoint?: string;
+  /**
+   * Endpoints for browser-facing presigned URLs (S3_BROWSER_ENDPOINT), first
+   * one as the default. Empty means presigned URLs use `endpoint`.
+   */
+  browserEndpoints: BrowserEndpoint[];
   accessKeyId?: string;
   secretAccessKey?: string;
   /** Required by most non-AWS S3-compatible servers. */
