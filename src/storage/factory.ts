@@ -12,7 +12,7 @@ function envBool(value: string | undefined, fallback: boolean): boolean {
 
 /**
  * Parses S3_BROWSER_ENDPOINT: a comma-separated list of `url` or `name=url`
- * entries. Names become the ids clients pick; `direct` is reserved.
+ * entries. Names become the ids clients pick.
  */
 export function parseBrowserEndpoints(raw: string | undefined): BrowserEndpoint[] {
   const entries: BrowserEndpoint[] = [];
@@ -23,9 +23,6 @@ export function parseBrowserEndpoints(raw: string | undefined): BrowserEndpoint[
       new URL(entry.url);
     } catch {
       throw new Error(`S3_BROWSER_ENDPOINT has an invalid URL: ${entry.url}`);
-    }
-    if (entry.name === "direct") {
-      throw new Error("S3_BROWSER_ENDPOINT name 'direct' is reserved for S3_ENDPOINT");
     }
     entries.push(entry);
   }

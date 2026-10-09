@@ -64,8 +64,10 @@ export class S3Storage implements ObjectStorage {
       ...clientOptions,
       endpoint: config.endpoint,
     });
-    // Browser endpoints first (unnamed ones are browser, browser2, ...), then
-    // S3_ENDPOINT as `direct` unless a browser entry already points there.
+    // One target per browser endpoint (unnamed ones are browser, browser2,
+    // ...). S3_ENDPOINT is not offered: it is usually plain http, which an
+    // https page cannot fetch. It only signs URLs when no browser endpoint is
+    // configured.
     const browser = config.browserEndpoints;
     this.presignTargets = browser.map((entry, index) => ({
       id: entry.name ?? (index === 0 ? "browser" : `browser${index + 1}`),
@@ -76,13 +78,10 @@ export class S3Storage implements ObjectStorage {
           ? this.client
           : new S3Client({ ...clientOptions, endpoint: entry.url }),
     }));
-    if (
-      this.presignTargets.length === 0 ||
-      (config.endpoint && !browser.some((entry) => sameUrl(entry.url, config.endpoint!)))
-    ) {
+    if (this.presignTargets.length === 0) {
       this.presignTargets.push({
-        id: "direct",
-        label: "Direct",
+        id: "default",
+        label: "Default",
         url: config.endpoint ?? "",
         client: this.client,
       });

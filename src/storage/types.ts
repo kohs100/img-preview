@@ -52,9 +52,9 @@ export interface ObjectStorage {
 }
 
 /**
- * Endpoints a presigned redirect URL can point at: every S3_BROWSER_ENDPOINT
- * entry (e.g. a CDN in front of the store) and `direct`, the S3_ENDPOINT the
- * server itself uses. Unknown ids fall back to `default`.
+ * Endpoints a presigned redirect URL can point at: the S3_BROWSER_ENDPOINT
+ * entries (e.g. a CDN in front of the store). Unknown ids fall back to
+ * `default`.
  */
 export type RedirectEndpoints = {
   default: string;
