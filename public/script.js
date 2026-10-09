@@ -31,13 +31,12 @@ const DOWNLOAD_BATCH_SIZE = 200;
 let downloadSession = 0;
 const MAX_POLL_RETRY = 60;
 // Image downloads (the /cached request plus the storage/CDN request) in
-// flight at once across the page; more queue up instead of opening a burst
-// of connections the storage proxy may reset.
+// flight at once across the page. Every card of a list is queued in list
+// order as soon as it renders, so the list downloads front to back without
+// opening a burst of connections the storage proxy may reset.
 const IMAGE_FETCH_CONCURRENCY = 6;
-// Storage connection failures retried per image, with exponential backoff.
+// Storage connection failures retried per image, POLL_INTERVAL_MS apart.
 const MAX_STORAGE_RETRIES = 5;
-// Cards start loading when they come this close to the viewport.
-const CARD_PRELOAD_MARGIN = "600px";
 const textEncoder = new TextEncoder();
 const PASSPHRASE_STORAGE_KEY = "img-preview.cache-passphrase.v1";
 // Per browser: which endpoint is reachable or fastest depends on the viewer.
@@ -584,7 +583,6 @@ async function setImagePolling(img, cachedUrl, onProgress, generation) {
       return null;
     }
 
-    let delayMs = POLL_INTERVAL_MS;
     if (result.storageError) {
       storageFailures += 1;
       if (storageFailures > MAX_STORAGE_RETRIES) {
@@ -595,46 +593,16 @@ async function setImagePolling(img, cachedUrl, onProgress, generation) {
         return null;
       }
       // Retrying /cached also yields a fresh presigned URL.
-      delayMs = Math.min(1000 * 2 ** (storageFailures - 1), 16000);
       onProgress({ phase: "queued" });
     }
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     if (isStale()) return null;
   }
   return null;
 }
 
-// Starts each card's download when it nears the viewport, so a long list
-// does not request every image at once.
-const cardStarters = new WeakMap();
-const cardObserver =
-  typeof IntersectionObserver === "function"
-    ? new IntersectionObserver(
-        (entries) => {
-          for (const entry of entries) {
-            if (!entry.isIntersecting) continue;
-            const start = cardStarters.get(entry.target);
-            cardStarters.delete(entry.target);
-            cardObserver.unobserve(entry.target);
-            if (start) start();
-          }
-        },
-        { rootMargin: CARD_PRELOAD_MARGIN }
-      )
-    : null;
-
-function startWhenVisible(element, start) {
-  if (!cardObserver) {
-    start();
-    return;
-  }
-  cardStarters.set(element, start);
-  cardObserver.observe(element);
-}
-
 function clearList() {
   downloadSession += 1;
-  cardObserver?.disconnect();
   listEl.innerHTML = "";
   listEl.classList.remove("download-grid");
 }
@@ -718,21 +686,18 @@ function makeCard({ src, label, onClick, openImage = false }) {
     loadStatus.hidden = progress.phase === "ready";
     loadStatus.classList.toggle("error", progress.phase === "failed");
   };
-  const generation = downloadSession;
-  startWhenVisible(card, () => {
-    void setImagePolling(img, src, onProgress, generation).then((objectUrl) => {
-      if (
-        openImage &&
-        objectUrl &&
-        mediaWrapper instanceof HTMLAnchorElement
-      ) {
-        mediaWrapper.href = objectUrl;
-      }
-    }).catch((error) => {
-      img.alt = error instanceof Error ? error.message : "Image decryption failed";
-      loadStatus.textContent = "Failed";
-      loadStatus.classList.add("error");
-    });
+  void setImagePolling(img, src, onProgress, downloadSession).then((objectUrl) => {
+    if (
+      openImage &&
+      objectUrl &&
+      mediaWrapper instanceof HTMLAnchorElement
+    ) {
+      mediaWrapper.href = objectUrl;
+    }
+  }).catch((error) => {
+    img.alt = error instanceof Error ? error.message : "Image decryption failed";
+    loadStatus.textContent = "Failed";
+    loadStatus.classList.add("error");
   });
   img.alt = label;
 
