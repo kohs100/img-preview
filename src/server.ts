@@ -10,10 +10,6 @@ const port = process.env.PORT ? Number(process.env.PORT) : 3013;
 const originMinIntervalMs = process.env.ORIGIN_MIN_INTERVAL_MS
   ? Number(process.env.ORIGIN_MIN_INTERVAL_MS)
   : 200;
-// How long a cached origin error is honored before the next request retries it.
-const errorRetryMs = process.env.ERROR_RETRY_MS
-  ? Number(process.env.ERROR_RETRY_MS)
-  : 5 * 60 * 1000;
 const originMaxConcurrency = process.env.ORIGIN_MAX_CONCURRENCY
   ? Number(process.env.ORIGIN_MAX_CONCURRENCY)
   : 8;
@@ -227,24 +223,20 @@ function sendProcessing(res: express.Response, entry?: CacheEntry): void {
   res.status(503).json(processingPayload(entry));
 }
 
-/**
- * Starts a cache fill for a URL that is not cached yet or whose cached error
- * is older than ERROR_RETRY_MS, and returns the entry to report. Ready
- * entries, running fills and fresh errors are returned unchanged.
- */
+/** Failures are terminal until an explicit reload, regardless of their age. */
 function ensureFill(
   cacheKey: string,
   fetchUrl: string,
   referrer: string,
-  entry: CacheEntry | undefined
+  entry: CacheEntry | undefined,
+  reload = false
 ): CacheEntry | undefined {
-  if (entry?.status === "ready" || entry?.status === "processing") return entry;
-  if (entry?.status === "error") {
-    const errorAgeMs = Date.now() - entry.updatedAt;
-    if (!(errorRetryMs > 0 && errorAgeMs >= errorRetryMs)) return entry;
-    // Cached error is stale; retry the origin instead of serving it again.
+  if (reload && entry?.status !== "processing") {
     startDownload(cacheKey, fetchUrl, referrer);
-  } else if (cacheManager.claimProcessing(cacheKey)) {
+    return cacheManager.getCached(cacheKey);
+  }
+  if (entry) return entry;
+  if (cacheManager.claimProcessing(cacheKey)) {
     startDownload(cacheKey, fetchUrl, referrer);
   }
   return cacheManager.getCached(cacheKey);
@@ -281,7 +273,13 @@ app.get("/cached/:imageUrl(*)", async (req, res) => {
 
   const { cacheKey, fetchUrl, referrer } = params;
   const entry =
-    (await cacheManager.get(cacheKey)) ?? cacheManager.getCached(cacheKey);
+    cacheManager.getCached(cacheKey) ?? (await cacheManager.get(cacheKey));
+
+  if (firstQueryValue(req.query.reload) === "true" || firstQueryValue(req.query.reload) === "1") {
+    const current = ensureFill(cacheKey, fetchUrl, referrer, entry, true);
+    sendProcessing(res, current);
+    return;
+  }
 
   if (entry?.status === "ready" && entry.key && entry.contentType) {
     // Offload the byte transfer to the storage backend when it can hand out a
@@ -352,7 +350,7 @@ app.post(
   express.json({ limit: "1mb" }),
   async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
-    const body = (req.body ?? {}) as { urls?: unknown; referrer?: unknown };
+    const body = (req.body ?? {}) as { urls?: unknown; referrer?: unknown; reload?: unknown };
     const urls = body.urls;
     if (
       !Array.isArray(urls) ||
@@ -386,8 +384,8 @@ app.post(
               referrerQuery
             );
             const entry =
-              (await cacheManager.get(cacheKey)) ?? cacheManager.getCached(cacheKey);
-            const current = ensureFill(cacheKey, fetchUrl, referrer, entry);
+              cacheManager.getCached(cacheKey) ?? (await cacheManager.get(cacheKey));
+            const current = ensureFill(cacheKey, fetchUrl, referrer, entry, body.reload === true);
             if (current?.status === "ready") {
               results[index] = { status: "ready", phase: "ready" };
             } else if (current?.status === "error") {

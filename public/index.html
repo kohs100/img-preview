@@ -95,9 +95,7 @@
             <button type="submit" id="savePassphraseButton">
               Unlock and remember
             </button>
-            <button type="button" id="forgetPassphraseButton" class="secondary">
-              Forget and lock
-            </button>
+
           </div>
         </form>
         <p class="storage-warning">
@@ -106,8 +104,15 @@
         </p>
       </section>
 
+      <button type="button" id="forgetPassphraseButton" class="secondary small" hidden>Forget passphrase</button>
+
       <div id="status"></div>
       <div id="modeLabel"></div>
+      <div id="listingToolbar" class="route-toolbar" hidden>
+        <label class="inline-toggle"><input type="checkbox" id="skipFailed"> Skip origin failures</label>
+        <button type="button" id="retryListingFailed" class="secondary small" hidden>Retry failed URLs</button>
+        <span id="listingFailureCount" role="status"></span>
+      </div>
       <section id="list" aria-live="polite"></section>
     </main>
     <script src="/static/script.js" defer></script>

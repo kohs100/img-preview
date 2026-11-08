@@ -162,7 +162,6 @@ CORS 없이 동작합니다.
 | `PROXY_IP_CHECK_URL`      | `https://ifconfig.me/ip` | 외부 IP를 평문으로 돌려주는 health check URL |
 | `PROXY_CHECK_TIMEOUT_MS`  | `15000`     | 경로 하나의 health check 제한시간 |
 | `PROXY_CHECK_INTERVAL_MS` | `600000`    | 전체 경로 재검사 주기. `0`이면 시작 시 한 번만 |
-| `ERROR_RETRY_MS`          | `300000`    | 캐시된 origin 에러를 재시도 없이 그대로 반환하는 기간(ms). 이보다 오래된 에러는 다음 요청에서 origin 재시도. `0`이면 비활성화(에러 영구 캐시) |
 | `CACHE_BACKEND`           | `fs`        | `fs` 또는 `s3` |
 | `CACHE_DIR`               | `cache`     | `fs` 백엔드의 베이스 디렉터리 |
 | `CACHE_ENCRYPTION`        | `false`     | `true`면 객체 본문과 논리 경로를 애플리케이션 계층에서 암호화 |
@@ -301,3 +300,15 @@ src/
     index.ts           배럴 익스포트
 public/                정적 프론트엔드 (index.html, script.js, proxies.html, proxies.js, style.css)
 ```
+
+Origin 실패는 서버 프로세스 내에서 유지되며 자동으로 재시도하지 않습니다. 리스팅과 Download 화면의 Retry 버튼으로 명시적으로 재시도합니다. 서버 재시작 시 메모리의 실패 상태는 초기화됩니다. 리스팅의 Skip origin failures 옵션은 실패 항목을 숨기며 브라우저에 저장됩니다.
+
+`GET /cached/:imageUrl?reload=true` 또는 `POST /api/cache-status`의 JSON `reload: true`로 명시적 재다운로드를 요청할 수 있습니다. 플래그가 없으면 실패 기록은 경과 시간과 관계없이 즉시 반환합니다. 진행 중인 다운로드는 중복 시작하지 않습니다.
+
+S3 이미지(`source/`, `processed/`, 암호화 시 해당 논리 경로)는 업로드 시
+`Cache-Control: public, max-age=300, s-maxage=86400`을 저장합니다.
+인덱스와 마스터 키 envelope에는 `no-store`를 저장합니다.
+기존 객체는 `npm run set-cache-control`로 변경 대상을 확인하고,
+`npm run set-cache-control -- --apply`로 메타데이터를 적용합니다.
+객체 본문은 서버 측 복사로 유지하며 ETag와 크기, 적용 헤더를 검증합니다.
+이미 CF에 캐시된 응답은 별도로 purge해야 새 정책을 즉시 적용할 수 있습니다.

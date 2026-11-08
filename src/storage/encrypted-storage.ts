@@ -1,4 +1,5 @@
 import { randomBytes } from "crypto";
+import { imageCacheControl } from "./cache-policy";
 import type { ObjectStorage, RedirectEndpoints } from "./types";
 import {
   decryptObject,
@@ -75,7 +76,9 @@ export class EncryptedStorage implements ObjectStorage {
     const physicalKey = this.physicalKey(key);
     onPhase?.("encrypting");
     const encrypted = encryptObject(data, this.masterKey);
-    await this.inner.write(physicalKey, encrypted, "application/octet-stream", onPhase);
+    await this.inner.write(physicalKey, encrypted, "application/octet-stream", onPhase, {
+      cacheControl: imageCacheControl(key),
+    });
   }
 
   async exists(key: string): Promise<boolean> {

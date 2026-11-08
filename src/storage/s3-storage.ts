@@ -1,3 +1,4 @@
+import { imageCacheControl } from "./cache-policy";
 import {
   DeleteObjectCommand,
   GetObjectCommand,
@@ -112,7 +113,8 @@ export class S3Storage implements ObjectStorage {
     key: string,
     data: Buffer,
     contentType?: string,
-    onPhase?: (phase: "encrypting" | "uploading") => void
+    onPhase?: (phase: "encrypting" | "uploading") => void,
+    options?: { cacheControl?: string }
   ): Promise<void> {
     onPhase?.("uploading");
     const controller = new AbortController();
@@ -124,6 +126,7 @@ export class S3Storage implements ObjectStorage {
           Key: this.toObjectKey(key),
           Body: data,
           ContentType: contentType,
+          CacheControl: options?.cacheControl ?? imageCacheControl(key),
         }),
         { abortSignal: controller.signal }
       );

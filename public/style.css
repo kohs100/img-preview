@@ -178,8 +178,8 @@ button.secondary {
 .item img {
   display: block;
   width: 100%;
-  aspect-ratio: 1 / 1;
-  object-fit: cover;
+  height: auto;
+  object-fit: contain;
   background: #ece7df;
 }
 
@@ -361,4 +361,25 @@ button.small {
 
 .page.wide {
   max-width: 1400px;
+}
+
+/* Keep intrinsic image proportions and each card at its own content height. */
+#list { align-items: start; }
+.item img:not([src]) { min-height: 160px; }
+[hidden] { display: none !important; }
+.inline-toggle { flex-direction: row; align-items: center; }
+.inline-toggle input { height: auto; }
+#forgetPassphraseButton { margin-top: 10px; }
+.image-box { position: relative; }
+.item .retry-image {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: auto;
+  padding: 7px 14px;
+  line-height: 1.2;
+  background: var(--accent);
+  color: white;
+  z-index: 1;
 }

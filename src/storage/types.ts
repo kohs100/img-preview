@@ -23,7 +23,8 @@ export interface ObjectStorage {
     key: string,
     data: Buffer,
     contentType?: string,
-    onPhase?: (phase: "encrypting" | "uploading") => void
+    onPhase?: (phase: "encrypting" | "uploading") => void,
+    options?: { cacheControl?: string }
   ): Promise<void>;
 
   /** Resolve true if the key exists. */

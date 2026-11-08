@@ -18,6 +18,28 @@ const encryptionStatus = document.getElementById("encryptionStatus");
 const savePassphraseButton = document.getElementById("savePassphraseButton");
 const forgetPassphraseButton = document.getElementById("forgetPassphraseButton");
 
+const listingToolbar = document.getElementById("listingToolbar");
+const skipFailed = document.getElementById("skipFailed");
+const retryListingFailed = document.getElementById("retryListingFailed");
+const listingFailureCount = document.getElementById("listingFailureCount");
+let listingCards = [];
+try { skipFailed.checked = localStorage.getItem("img-preview.skip-failed") === "true"; } catch {}
+function updateListingFailures() {
+  const failed = listingCards.filter((item) => item.originFailed);
+  for (const item of listingCards) item.card.hidden = skipFailed.checked && item.originFailed;
+  retryListingFailed.hidden = failed.length === 0;
+  listingFailureCount.textContent = failed.length ? `${failed.length} origin failures` : "";
+}
+skipFailed.addEventListener("change", () => {
+  try { localStorage.setItem("img-preview.skip-failed", String(skipFailed.checked)); } catch {}
+  updateListingFailures();
+});
+retryListingFailed.addEventListener("click", async () => {
+  retryListingFailed.disabled = true;
+  try { await Promise.all(listingCards.filter((item) => item.originFailed).map((item) => item.retry())); }
+  finally { retryListingFailed.disabled = false; }
+});
+
 let state = null;
 let currentView = {
   mode: "main",
@@ -51,14 +73,13 @@ function decodeBase64(value) {
 
 function encryptionConfig() {
   if (!encryptionConfigPromise) {
-    encryptionConfigPromise = fetch("/api/encryption/config", { cache: "no-store" })
+    encryptionConfigPromise = fetch("/api/encryption/config", { cache: "no-store", signal: AbortSignal.timeout(15000) })
       .then((response) => {
         if (!response.ok) throw new Error("Encryption configuration is unavailable");
         return response.json();
       })
       .then((config) => {
-        encryptionPanel.hidden = !config.enabled;
-        if (config.enabled) updateEncryptionStatus();
+        forgetPassphraseButton.hidden = !config.enabled;
         return config;
       });
   }
@@ -169,7 +190,7 @@ async function obtainMasterKey() {
   if (saved) {
     try {
       const key = await deriveMasterKey(config.envelope, saved);
-      updateEncryptionStatus("Unlocked with the remembered passphrase.");
+      encryptionPanel.hidden = true;
       return key;
     } catch {
       forgetStoredPassphrase();
@@ -179,6 +200,7 @@ async function obtainMasterKey() {
       );
     }
   }
+  if (!saved) updateEncryptionStatus("Enter the passphrase to unlock images.");
   encryptionPanel.hidden = false;
   encryptionPassphrase.focus();
   return new Promise((resolve) => {
@@ -381,6 +403,7 @@ async function logSubmissionRecord({
 
 function formatProgress(progress) {
   const labels = {
+    checking: "Checking encryption configuration",
     queued: "Queued",
     downloading: "Downloading origin",
     transforming: "Transforming",
@@ -479,10 +502,27 @@ class StorageFetchError extends Error {}
 async function fetchImageAttempt(cachedUrl, config, onProgress) {
   let response;
   try {
-    response = await fetch(cachedUrl, { cache: "no-store" });
-  } catch {
-    onProgress({ phase: "queued" });
-    return { pending: true };
+    response = await fetch(cachedUrl, { cache: "no-store", signal: AbortSignal.timeout(60000) });
+  } catch (error) {
+    throw new Error(`Cache API request failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // The JSON state is authoritative: an origin 503 is an error, while our
+  // own 503 with status=processing is the only response that should poll.
+  let json;
+  if ((response.headers.get("content-type") || "").includes("application/json")) {
+    try { json = await response.json(); }
+    catch { throw new Error(`Invalid cache API response (HTTP ${response.status})`); }
+    if (json?.status === "error") {
+      return { failed: {
+        phase: "failed", errorStatusCode: json.errorStatusCode ?? response.status,
+        message: json.message || "Origin request failed",
+      } };
+    }
+    if (response.status === 503 && json?.status === "processing") {
+      onProgress(json);
+      return { pending: true };
+    }
   }
 
   if (response.status === 200) {
@@ -494,13 +534,13 @@ async function fetchImageAttempt(cachedUrl, config, onProgress) {
       config.enabled &&
       (response.headers.get("content-type") || "").includes("application/json")
     ) {
-      const descriptor = await response.json();
+      const descriptor = json;
       if (!descriptor.encrypted || !descriptor.url) {
         throw new Error("Invalid encrypted image descriptor");
       }
       contentType = descriptor.contentType || "";
       try {
-        bodyResponse = await fetch(descriptor.url, { cache: "no-store" });
+        bodyResponse = await fetch(descriptor.url, { cache: "no-store", signal: AbortSignal.timeout(60000) });
       } catch (error) {
         throw new StorageFetchError(error instanceof Error ? error.message : String(error));
       }
@@ -515,23 +555,12 @@ async function fetchImageAttempt(cachedUrl, config, onProgress) {
     }
   }
 
-  if (response.status === 503) {
-    try {
-      const progress = await response.json();
-      if (progress?.status === "processing") onProgress(progress);
-    } catch {
-      onProgress({ phase: "queued" });
-    }
-    return { pending: true };
-  }
-
   let errorStatusCode = response.status;
   let message = `Request failed with HTTP ${response.status}`;
   try {
     if ((response.headers.get("content-type") || "").includes("application/json")) {
-      const payload = await response.json();
-      errorStatusCode = payload.errorStatusCode ?? response.status;
-      message = payload.message || message;
+      errorStatusCode = json?.errorStatusCode ?? response.status;
+      message = json?.message || message;
     } else {
       message = (await response.text()) || message;
     }
@@ -547,6 +576,7 @@ async function fetchImageAttempt(cachedUrl, config, onProgress) {
  * and before sleeping. Stops once the list it belongs to is replaced.
  */
 async function setImagePolling(img, cachedUrl, onProgress, generation) {
+  onProgress({ phase: "checking" });
   const config = await encryptionConfig();
   const isStale = () => generation !== downloadSession;
   onProgress({ phase: "queued" });
@@ -573,6 +603,7 @@ async function setImagePolling(img, cachedUrl, onProgress, generation) {
         onProgress({ phase: "decrypting" });
         bytes = await decryptImagePayload(result.payload);
       }
+      if (isStale()) return null;
       const objectUrl = URL.createObjectURL(new Blob([bytes], { type: result.contentType }));
       img.src = objectUrl;
       onProgress({ phase: "ready", percent: 100 });
@@ -598,11 +629,16 @@ async function setImagePolling(img, cachedUrl, onProgress, generation) {
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     if (isStale()) return null;
   }
+  onProgress({ phase: "failed", message: "Timed out waiting for image. Retry to continue." });
   return null;
 }
 
 function clearList() {
   downloadSession += 1;
+  for (const item of listingCards) item.dispose();
+  listingCards = [];
+  listingToolbar.hidden = true;
+  updateListingFailures();
   listEl.innerHTML = "";
   listEl.classList.remove("download-grid");
 }
@@ -681,24 +717,54 @@ function makeCard({ src, label, onClick, openImage = false }) {
   const loadStatus = document.createElement("div");
   loadStatus.className = "load-status";
   loadStatus.textContent = "Queued…";
+  const retryButton = document.createElement("button");
+  retryButton.type = "button";
+  retryButton.className = "retry-image";
+  retryButton.textContent = "Retry";
+  retryButton.hidden = true;
+  const session = downloadSession;
+  const item = { card, originFailed: false, retry: null };
+  listingCards.push(item);
+  let busy = false;
+  let objectUrl = null;
   const onProgress = (progress) => {
+    if (session !== downloadSession) return;
+    item.originFailed = progress.phase === "failed" && Number.isInteger(progress.errorStatusCode);
     loadStatus.textContent = formatProgress(progress);
     loadStatus.hidden = progress.phase === "ready";
     loadStatus.classList.toggle("error", progress.phase === "failed");
+    retryButton.hidden = progress.phase !== "failed";
+    updateListingFailures();
   };
-  void setImagePolling(img, src, onProgress, downloadSession).then((objectUrl) => {
-    if (
-      openImage &&
-      objectUrl &&
-      mediaWrapper instanceof HTMLAnchorElement
-    ) {
-      mediaWrapper.href = objectUrl;
+  const load = async (refresh = false) => {
+    if (busy || session !== downloadSession) return;
+    busy = true;
+    retryButton.disabled = true;
+    item.originFailed = false;
+    onProgress({ phase: "queued" });
+    try {
+      if (refresh) {
+        const refreshUrl = new URL(src, window.location.href);
+        refreshUrl.searchParams.set("reload", "true");
+        const response = await fetch(refreshUrl, { cache: "no-store" });
+        const result = await response.json();
+        if (result.status !== "processing") throw new Error(result.message || "Retry request failed");
+      }
+      const nextUrl = await setImagePolling(img, src, onProgress, session);
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      objectUrl = nextUrl;
+      if (openImage && nextUrl && mediaWrapper instanceof HTMLAnchorElement) mediaWrapper.href = nextUrl;
+    } catch (error) {
+      onProgress({ phase: "failed", message: error instanceof Error ? error.message : "Image load failed" });
+    } finally {
+      busy = false;
+      retryButton.disabled = false;
     }
-  }).catch((error) => {
-    img.alt = error instanceof Error ? error.message : "Image decryption failed";
-    loadStatus.textContent = "Failed";
-    loadStatus.classList.add("error");
-  });
+  };
+  item.dispose = () => { if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  item.retry = () => load(true);
+  retryButton.addEventListener("click", item.retry);
+  void load();
   img.alt = label;
 
   const meta = document.createElement("div");
@@ -707,13 +773,18 @@ function makeCard({ src, label, onClick, openImage = false }) {
 
   mediaWrapper.appendChild(img);
   mediaWrapper.appendChild(loadStatus);
-  card.appendChild(mediaWrapper);
+  const imageBox = document.createElement("div");
+  imageBox.className = "image-box";
+  imageBox.appendChild(mediaWrapper);
+  imageBox.appendChild(retryButton);
+  card.appendChild(imageBox);
   card.appendChild(meta);
   return card;
 }
 
 function renderMainList() {
   clearList();
+  listingToolbar.hidden = false;
   modeLabelEl.textContent = "Main List: f(*, *, 0)";
   backButton.hidden = true;
   downloadAllButton.hidden = false;
@@ -744,6 +815,7 @@ function renderMainList() {
 
 function renderTypeList(characterIndex, clothesIndex) {
   clearList();
+  listingToolbar.hidden = false;
   backButton.hidden = false;
   downloadAllButton.hidden = true;
   currentView = {
@@ -926,10 +998,10 @@ function renderDownloadView() {
     retryButton.disabled = true;
     const failed = items.filter((item) => item.cell.dataset.status === "error");
     const params = new URLSearchParams({ referrer: selectedReferrer() });
-    // /refresh restarts the fill even while the error is still cached.
+    // Only this explicit action sends reload; ordinary polls preserve failures.
     await Promise.all(failed.map(async (item) => {
       try {
-        await fetch(`/refresh/${item.path}?${params.toString()}`, { cache: "no-store" });
+        await fetch(`/cached/${item.path}?${params.toString()}&reload=true`, { cache: "no-store" });
       } catch {
         // The next poll reports the item's state either way.
       }
@@ -1036,6 +1108,7 @@ encryptionForm.addEventListener("submit", async (event) => {
       pendingUnlockResolve = null;
     }
     encryptionPassphrase.value = "";
+    encryptionPanel.hidden = true;
     updateEncryptionStatus(
       remembered
         ? "Unlocked. Passphrase remembered on this browser."
@@ -1057,7 +1130,7 @@ forgetPassphraseButton.addEventListener("click", () => {
   updateEncryptionStatus(
     "Forgotten and locked. Already displayed images remain visible."
   );
-  encryptionPassphrase.focus();
+  encryptionPanel.hidden = true;
 });
 
 function hydrateFromQuery() {
@@ -1119,6 +1192,5 @@ function hydrateFromQuery() {
 // Restored images should already use the remembered endpoint.
 void loadEndpointOptions().finally(hydrateFromQuery);
 void encryptionConfig().catch(() => {
-  encryptionPanel.hidden = false;
-  updateEncryptionStatus("Could not load encryption configuration.", true);
+  setStatus("Could not load encryption configuration.", true);
 });
